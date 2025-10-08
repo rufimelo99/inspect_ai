@@ -74,6 +74,7 @@ def file(
     # get the default storage options for the scheme then apply passed options
     options = default_fs_options(file)
     options.update(fs_options)
+    options.update({"anon": True})
 
     # open the file
     open_file = fsspec.open(file, mode=mode, encoding=encoding, **options)
@@ -315,6 +316,7 @@ def filesystem(path: str, fs_options: dict[str, Any] = {}) -> FileSystem:
     # determine options
     options = default_fs_options(path)
     options.update(fs_options)
+    options.update({"anon": True})
 
     # create filesystem
     fs, path = fsspec.core.url_to_fs(path, **options)
