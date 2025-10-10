@@ -318,6 +318,13 @@ def hf_inference_providers() -> type[ModelAPI]:
     return HFInferenceProvidersAPI
 
 
+@modelapi(name="simpler_agent")
+def simpler_agent() -> type[ModelAPI]:
+    # in the clear
+    from .simpler_agent import SimplerAgentAPI
+
+    return SimplerAgentAPI
+
 def validate_openai_client(feature: str) -> None:
     FEATURE = feature
     PACKAGE = "openai"
