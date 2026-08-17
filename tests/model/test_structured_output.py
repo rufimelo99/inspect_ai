@@ -1,8 +1,11 @@
 import pytest
 from pydantic import BaseModel, ValidationError
 from test_helpers.utils import (
+    skip_if_no_anthropic,
     skip_if_no_google,
+    skip_if_no_grok,
     skip_if_no_mistral,
+    skip_if_no_moonshot,
     skip_if_no_openai,
 )
 
@@ -140,6 +143,12 @@ def test_openai_structured_output():
     check_nested_pydantic_output("openai/gpt-4o-mini")
 
 
+@skip_if_no_anthropic
+def test_anthropic_structured_output():
+    check_color_structured_output("anthropic/claude-sonnet-4-5")
+    check_nested_pydantic_output("anthropic/claude-sonnet-4-5")
+
+
 @skip_if_no_openai
 def test_openai_responses_structured_output_color():
     model = get_model("openai/gpt-4o-mini", responses_api=True)
@@ -157,11 +166,24 @@ def test_openai_responses_structured_output_pydantic():
 
 @skip_if_no_google
 def test_google_structured_output():
-    check_color_structured_output("google/gemini-2.0-flash")
-    check_nested_pydantic_output("google/gemini-2.0-flash")
+    check_color_structured_output("google/gemini-3.1-flash-lite")
+    check_nested_pydantic_output("google/gemini-3.1-flash-lite")
 
 
+@pytest.mark.flaky
 @skip_if_no_mistral
 def test_mistral_structured_output():
     check_color_structured_output("mistral/mistral-large-latest")
     check_nested_pydantic_output("mistral/mistral-large-latest")
+
+
+@skip_if_no_grok
+def test_grok_structured_output():
+    check_color_structured_output("grok/grok-4-fast-reasoning")
+    check_nested_pydantic_output("grok/grok-4-fast-reasoning")
+
+
+@skip_if_no_moonshot
+def test_moonshot_structured_output():
+    check_color_structured_output("moonshot/kimi-k3")
+    check_nested_pydantic_output("moonshot/kimi-k3")

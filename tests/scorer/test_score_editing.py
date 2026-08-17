@@ -1,15 +1,20 @@
 """Tests for score editing functionality."""
 
+from pathlib import Path
+
 import pytest
 
 from inspect_ai import Task, eval_async, task
 from inspect_ai.dataset import MemoryDataset, Sample
+from inspect_ai.event._score_edit import ScoreEditEvent
+from inspect_ai.log._edit import ProvenanceData
 from inspect_ai.log._metric import recompute_metrics
 from inspect_ai.log._score import edit_score
 from inspect_ai.scorer import Score, Target, accuracy, mean, scorer
-from inspect_ai.scorer._metric import ProvenanceData, ScoreEdit
+from inspect_ai.scorer._metric import ScoreEdit
 from inspect_ai.scorer._scorer import Scorer
-from inspect_ai.solver import TaskState
+from inspect_ai.solver import Generate, TaskState, solver
+from inspect_ai.solver._solver import Solver
 
 
 @scorer(metrics=[mean()])
@@ -321,9 +326,6 @@ async def test_edit_score_error_cases():
     with pytest.raises(ValueError, match="Sample with id invalid_id not found"):
         edit_score(log, "invalid_id", "single_metric_scorer", edit)
 
-    with pytest.raises(ValueError, match="Score 'invalid_scorer' not found"):
-        edit_score(log, log.samples[0].id, "invalid_scorer", edit)
-
 
 @pytest.mark.anyio
 async def test_edit_score_without_recompute():
@@ -346,3 +348,328 @@ async def test_edit_score_without_recompute():
 
     recompute_metrics(log)
     assert log.results.scores[0].metrics["mean"].value != original_mean
+
+
+@pytest.mark.anyio
+async def test_edit_score_multiple_epochs_with_epoch_specified():
+    """Test editing scores when there are multiple epochs and epoch is specified."""
+    logs = await eval_async(single_metric_task(), epochs=3)
+    log = logs[0]
+
+    sample_id = log.samples[0].id
+
+    edit = ScoreEdit(value=5)
+    edit_score(
+        log, sample_id, "single_metric_scorer", edit, recompute_metrics=False, epoch=1
+    )
+
+    for sample in log.samples:
+        if sample.id == sample_id:
+            expected = 5 if sample.epoch == 1 else 1
+            assert sample.scores["single_metric_scorer"].value == expected
+
+
+@pytest.mark.anyio
+async def test_edit_score_multiple_epochs_without_epoch_fails():
+    """Test that editing without specifying epoch fails when there are multiple epochs."""
+    logs = await eval_async(single_metric_task(), epochs=2)
+    log = logs[0]
+
+    sample_id = log.samples[0].id
+
+    edit = ScoreEdit(value=5)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Multiple samples found with id .+\. You must specify the epoch parameter\.",
+    ):
+        edit_score(log, sample_id, "single_metric_scorer", edit)
+
+
+@pytest.mark.anyio
+async def test_edit_score_invalid_epoch():
+    """Test that editing with an invalid epoch raises an error."""
+    logs = await eval_async(single_metric_task(), epochs=2)
+    log = logs[0]
+
+    sample_id = log.samples[0].id
+
+    edit = ScoreEdit(value=5)
+
+    with pytest.raises(ValueError, match=r"Sample with id .+ and epoch 5 not found"):
+        edit_score(log, sample_id, "single_metric_scorer", edit, epoch=5)
+
+
+@pytest.mark.anyio
+async def test_add_new_score():
+    """Test adding a completely new score to a sample."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+    sample = log.samples[0]
+
+    assert "new_custom_score" not in sample.scores
+
+    edit = ScoreEdit(value=0.75, explanation="Manually added score")
+    edit_score(log, sample.id, "new_custom_score", edit, recompute_metrics=False)
+
+    assert "new_custom_score" in sample.scores
+    new_score = sample.scores["new_custom_score"]
+    assert new_score.value == 0.75
+    assert new_score.explanation == "Manually added score"
+    assert new_score.answer is None
+    assert len(new_score.history) == 1
+    assert new_score.history[0].value == 0.75
+
+
+@pytest.mark.anyio
+async def test_add_new_score_without_value_fails():
+    """Test that adding a new score without a value raises an error."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+    sample = log.samples[0]
+
+    edit = ScoreEdit(explanation="No value provided")
+
+    with pytest.raises(
+        ValueError, match="Cannot add new score .* without providing a value"
+    ):
+        edit_score(log, sample.id, "new_score", edit)
+
+
+@pytest.mark.anyio
+async def test_add_score_when_scores_is_none():
+    """Test adding a score when sample.scores is None."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+    sample = log.samples[0]
+    sample.scores = None
+
+    edit = ScoreEdit(value=1.0)
+    edit_score(log, sample.id, "new_score", edit, recompute_metrics=False)
+
+    assert sample.scores is not None
+    assert "new_score" in sample.scores
+    assert sample.scores["new_score"].value == 1.0
+
+
+@pytest.mark.anyio
+async def test_add_new_score_with_provenance():
+    """Test adding a new score with provenance tracking."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+    sample = log.samples[0]
+
+    provenance = ProvenanceData(author="annotator", reason="Manual annotation")
+    edit = ScoreEdit(value="C", provenance=provenance)
+    edit_score(log, sample.id, "annotation_score", edit, recompute_metrics=False)
+
+    new_score = sample.scores["annotation_score"]
+    assert new_score.value == "C"
+    assert len(new_score.history) == 1
+    assert new_score.history[0].provenance.author == "annotator"
+
+
+@pytest.mark.anyio
+async def test_add_new_score_creates_event():
+    """Test that adding a new score creates a ScoreEditEvent."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+    sample = log.samples[0]
+
+    edit = ScoreEdit(value=0.5)
+    edit_score(log, sample.id, "new_score", edit, recompute_metrics=False)
+
+    score_edit_events = [e for e in sample.events if isinstance(e, ScoreEditEvent)]
+    new_event = next(
+        (e for e in score_edit_events if e.score_name == "new_score"), None
+    )
+
+    assert new_event is not None
+    assert new_event.edit.value == 0.5
+
+
+@pytest.mark.anyio
+async def test_edit_after_add_maintains_history():
+    """Test that editing a newly added score maintains correct history."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+    sample = log.samples[0]
+
+    edit1 = ScoreEdit(value=0.5, explanation="Initial")
+    edit_score(log, sample.id, "new_score", edit1, recompute_metrics=False)
+
+    edit2 = ScoreEdit(value=0.75, explanation="Updated")
+    edit_score(log, sample.id, "new_score", edit2, recompute_metrics=False)
+
+    score = sample.scores["new_score"]
+    assert score.value == 0.75
+    assert score.explanation == "Updated"
+    assert len(score.history) == 2
+    assert score.history[0].value == 0.5
+    assert score.history[1].value == 0.75
+
+
+@pytest.mark.anyio
+async def test_add_new_score_with_recompute_metrics():
+    """Test adding new score with recompute_metrics=True doesn't break existing metrics."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+
+    original_mean = log.results.scores[0].metrics["mean"].value
+    assert original_mean == 1.0
+
+    sample = log.samples[0]
+    edit = ScoreEdit(value=0.75)
+    edit_score(log, sample.id, "new_custom_score", edit)
+
+    assert "new_custom_score" in sample.scores
+    assert sample.scores["new_custom_score"].value == 0.75
+    assert log.results.scores[0].metrics["mean"].value == original_mean
+
+
+@solver
+def solver_writes_score() -> Solver:
+    async def run(state: TaskState, generate: Generate) -> TaskState:
+        state.scores = {} if state.scores is None else state.scores
+        state.scores["custom_key"] = Score(value=1.0)
+        return state
+
+    return run
+
+
+@task
+def task_with_metrics_no_scorer():
+    return Task(
+        dataset=MemoryDataset([Sample(input="") for _ in range(4)]),
+        solver=solver_writes_score(),
+        metrics=[mean()],
+    )
+
+
+@pytest.mark.anyio
+async def test_recompute_metrics_when_task_has_no_scorers():
+    """recompute_metrics handles task metrics when log.eval.scorers is None."""
+    logs = await eval_async(task_with_metrics_no_scorer(), model="mockllm/model")
+    log = logs[0]
+
+    assert log.eval.scorers is None
+    assert log.results.scores[0].name == "custom_key"
+    assert log.results.scores[0].metrics["mean"].value == 1.0
+
+    edit_score(log, log.samples[0].id, "custom_key", ScoreEdit(value=0.0))
+
+    assert log.results.scores[0].name == "custom_key"
+    assert log.results.scores[0].metrics["mean"].value == 0.75  # (0 + 1 + 1 + 1) / 4
+
+
+def test_resolve_scorers_info_loads_task_file_metrics_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Custom scorer metrics from task files should resolve during recompute."""
+    import inspect_ai._eval.score as score_module
+    from inspect_ai._eval.loader import load_file_tasks as real_load_file_tasks
+    from inspect_ai._util.registry import _registry, registry_key
+    from inspect_ai.log._log import (
+        EvalConfig,
+        EvalDataset,
+        EvalLog,
+        EvalMetricDefinition,
+        EvalScorer,
+        EvalSpec,
+    )
+
+    metric_one = "task_file_recompute_metric_one"
+    metric_two = "task_file_recompute_metric_two"
+    task_file = tmp_path / "custom_metric_task.py"
+    task_file.write_text(
+        f"""
+from inspect_ai import Task, task
+from inspect_ai.dataset import MemoryDataset
+from inspect_ai.scorer import Metric, SampleScore, metric
+
+
+@metric
+def {metric_one}() -> Metric:
+    def score(scores: list[SampleScore]) -> float:
+        return 0.25
+
+    return score
+
+
+@metric
+def {metric_two}() -> Metric:
+    def score(scores: list[SampleScore]) -> float:
+        return 0.5
+
+    return score
+
+
+@task
+def custom_metric_task():
+    return Task(dataset=MemoryDataset([]), plan=[])
+""",
+        encoding="utf-8",
+    )
+
+    for metric_name in (metric_one, metric_two):
+        _registry.pop(registry_key("metric", metric_name), None)
+
+    load_calls: list[Path] = []
+
+    def load_file_tasks_once(path: Path) -> None:
+        load_calls.append(path)
+        real_load_file_tasks(path)
+
+    monkeypatch.setattr(score_module, "load_file_tasks", load_file_tasks_once)
+
+    log = EvalLog(
+        eval=EvalSpec(
+            created="2026-05-21T00:00:00+00:00",
+            task="custom_metric_task",
+            task_file=task_file.as_posix(),
+            dataset=EvalDataset(samples=0),
+            model="mockllm/model",
+            config=EvalConfig(),
+            scorers=[
+                EvalScorer(
+                    name="custom_scorer",
+                    metrics=[
+                        EvalMetricDefinition(name=metric_one),
+                        {"group": [EvalMetricDefinition(name=metric_two)]},
+                    ],
+                )
+            ],
+        )
+    )
+
+    infos = score_module.resolve_scorers_info(log)
+
+    assert load_calls == [task_file.absolute()]
+    metrics = infos[0].metrics
+    assert isinstance(metrics, list)
+    first_metric = metrics[0]
+    assert not isinstance(first_metric, dict)
+    assert first_metric([]) == 0.25
+    grouped_metrics = metrics[1]
+    assert isinstance(grouped_metrics, dict)
+    assert grouped_metrics["group"][0]([]) == 0.5
+
+
+@pytest.mark.anyio
+async def test_recompute_preserves_results_metadata():
+    """recompute_metrics should preserve caller-set EvalResults.metadata across the recompute."""
+    logs = await eval_async(single_metric_task())
+    log = logs[0]
+
+    log.results.metadata = {"training_step": 1234, "run_tag": "exp-42"}
+
+    edit_score(
+        log,
+        log.samples[0].id,
+        "single_metric_scorer",
+        ScoreEdit(value=0),
+        recompute_metrics=False,
+    )
+    recompute_metrics(log)
+
+    assert log.results.metadata == {"training_step": 1234, "run_tag": "exp-42"}

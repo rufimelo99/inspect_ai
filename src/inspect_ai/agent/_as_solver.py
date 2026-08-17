@@ -3,18 +3,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from inspect_ai.util._limit import Limit, apply_limits
-from inspect_ai.util._span import span
+from inspect_ai.util._span import AGENT_SPAN_TYPE, span
 
 if TYPE_CHECKING:
     from inspect_ai.solver._solver import Solver
 
 from inspect_ai._util.registry import (
+    RegistryInfo,
     is_registry_object,
-    registry_unqualified_name,
+    registry_info,
+    registry_params,
+    set_registry_info,
+    set_registry_params,
 )
 from inspect_ai.tool._tool_info import parse_tool_info
 
-from ._agent import Agent, AgentState
+from ._agent import Agent, AgentState, agent_display_name
 
 
 def as_solver(agent: Agent, limits: list[Limit] = [], **agent_kwargs: Any) -> Solver:
@@ -34,6 +38,7 @@ def as_solver(agent: Agent, limits: list[Limit] = [], **agent_kwargs: Any) -> So
     Solver:
        Solver from agent.
     """
+    from inspect_ai.solver._constants import SOLVER_ALL_PARAMS_ATTR
     from inspect_ai.solver._solver import Generate, solver
     from inspect_ai.solver._task_state import TaskState
 
@@ -42,7 +47,7 @@ def as_solver(agent: Agent, limits: list[Limit] = [], **agent_kwargs: Any) -> So
         raise RuntimeError(
             "Agent passed to as_solver was not created by an @agent decorated function"
         )
-    agent_name = registry_unqualified_name(agent)
+    agent_name = agent_display_name(agent)
 
     # check to make sure we have all the parameters we need to run the agent
     agent_info = parse_tool_info(agent)
@@ -54,7 +59,7 @@ def as_solver(agent: Agent, limits: list[Limit] = [], **agent_kwargs: Any) -> So
                 + "parameter to the as_solver() function."
             )
 
-    @solver(name=agent_name)
+    @solver
     def agent_to_solver() -> Solver:
         async def solve(state: TaskState, generate: Generate) -> TaskState:
             agent_state = AgentState(messages=state.messages)
@@ -62,7 +67,7 @@ def as_solver(agent: Agent, limits: list[Limit] = [], **agent_kwargs: Any) -> So
             try:
                 # run the agent with limits
                 with apply_limits(limits):
-                    async with span(name=agent_name, type="agent"):
+                    async with span(name=agent_name, type=AGENT_SPAN_TYPE):
                         agent_state = await agent(agent_state, **agent_kwargs)
             # if an exception occurs, we still want to update the TaskState with the
             # AgentState's messages + output so that it appears in the log and is scored
@@ -79,4 +84,9 @@ def as_solver(agent: Agent, limits: list[Limit] = [], **agent_kwargs: Any) -> So
         # return solver
         return solve
 
-    return agent_to_solver()
+    # create solver and forward name and registry params from agent
+    slv = agent_to_solver()
+    set_registry_info(slv, RegistryInfo(type="solver", name=registry_info(agent).name))
+    set_registry_params(slv, registry_params(agent))
+    setattr(slv, SOLVER_ALL_PARAMS_ATTR, getattr(agent, SOLVER_ALL_PARAMS_ATTR))
+    return slv

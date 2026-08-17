@@ -5,28 +5,29 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
-    Generator,
+    Iterable,
     Literal,
     Sequence,
     cast,
     overload,
 )
 
+from inspect_ai._util._async import run_coroutine, tg_collect
 from inspect_ai._util.hash import mm3_hash
 from inspect_ai._util.platform import running_in_notebook
 from inspect_ai.analysis._dataframe.progress import import_progress, no_progress
 from inspect_ai.event._event import Event
 from inspect_ai.log._file import (
-    list_eval_logs,
-    read_eval_log_sample_summaries,
-    read_eval_log_samples,
+    read_eval_log_async,
+    read_eval_log_sample_summaries_async,
 )
-from inspect_ai.log._log import EvalSample, EvalSampleSummary
+from inspect_ai.log._log import EvalLog, EvalSample, EvalSampleSummary
 from inspect_ai.model._chat_message import ChatMessage
 
 from ..columns import Column, ColumnError, ColumnType
@@ -57,43 +58,46 @@ SAMPLE_SUFFIX = "_sample"
 
 @overload
 def samples_df(
-    logs: LogPaths = list_eval_logs(),
+    logs: LogPaths | EvalLog | Sequence[EvalLog] | None = None,
     columns: Sequence[Column] = SampleSummary,
     full: bool = False,
     strict: Literal[True] = True,
     parallel: bool | int = False,
     quiet: bool | None = None,
+    exclude_fields: set[str] | None = None,
 ) -> "pd.DataFrame": ...
 
 
 @overload
 def samples_df(
-    logs: LogPaths = list_eval_logs(),
+    logs: LogPaths | EvalLog | Sequence[EvalLog] | None = None,
     columns: Sequence[Column] = SampleSummary,
     full: bool = False,
     strict: Literal[False] = False,
     parallel: bool | int = False,
     quiet: bool | None = None,
+    exclude_fields: set[str] | None = None,
 ) -> tuple["pd.DataFrame", list[ColumnError]]: ...
 
 
 def samples_df(
-    logs: LogPaths = list_eval_logs(),
+    logs: LogPaths | EvalLog | Sequence[EvalLog] | None = None,
     columns: Sequence[Column] = SampleSummary,
     full: bool = False,
     strict: bool = True,
     parallel: bool | int = False,
     quiet: bool | None = None,
+    exclude_fields: set[str] | None = None,
 ) -> "pd.DataFrame" | tuple["pd.DataFrame", list[ColumnError]]:
     """Read a dataframe containing samples from a set of evals.
 
     Args:
-       logs: One or more paths to log files or log directories.
+       logs: One or more paths to log files, log directories, or EvalLog objects.
           Defaults to the contents of the currently active log directory
           (e.g. ./logs or INSPECT_LOG_DIR).
        columns: Specification for what columns to read from log files.
        full: Read full sample `metadata`. This will be much slower, but will include
-          the unfiltered values of sample `metadata` rather than the abbrevivated
+          the unfiltered values of sample `metadata` rather than the abbreviated
           metadata from sample summaries (which includes only scalar values and limits
           string values to 1k).
        strict: Raise import errors immediately. Defaults to `True`.
@@ -104,6 +108,9 @@ def samples_df(
           do not read in parallel.
        quiet: If `True`, do not show any output or progress. Defaults to `False`
           for terminal environments, and `True` for notebooks.
+       exclude_fields: Set of EvalSample field names to skip when loading
+          samples (e.g. {"messages", "events", "store", "attachments"}).
+          Ignored for .json format logs (only applies to .eval logs).
 
     Returns:
        For `strict`, a Pandas `DataFrame` with information for the specified logs.
@@ -113,8 +120,16 @@ def samples_df(
     verify_prerequisites()
 
     quiet = quiet if quiet is not None else running_in_notebook()
+    logs = resolve_logs(logs)
+
     return _read_samples_df(
-        logs, columns, full=full, strict=strict, progress=not quiet, parallel=parallel
+        logs,
+        columns,
+        full=full,
+        strict=strict,
+        progress=not quiet,
+        parallel=parallel,
+        exclude_fields=exclude_fields,
     )
 
 
@@ -133,7 +148,7 @@ class EventsDetail:
 
 
 def _read_samples_df(
-    logs: LogPaths,
+    logs: list[str] | list[EvalLog],
     columns: Sequence[Column],
     *,
     full: bool = False,
@@ -141,45 +156,46 @@ def _read_samples_df(
     detail: MessagesDetail | EventsDetail | None = None,
     progress: bool = True,
     parallel: bool | int = False,
+    exclude_fields: set[str] | None = None,
 ) -> "pd.DataFrame" | tuple["pd.DataFrame", list[ColumnError]]:
     import pandas as pd
 
-    # resolve logs
-    logs = resolve_logs(logs)
+    # Parallel only makes sense for path-based reads
+    is_paths = len(logs) == 0 or isinstance(logs[0], str)
 
-    if parallel:
+    if parallel and is_paths:
         # resolve number of workers (cap at 8 as eventually we run into disk/memory contention)
         if parallel is True:
             parallel = max(min(mp.cpu_count(), 8), 2)
 
-        # flatted out list of logs
-        logs = resolve_logs(logs)
+        log_paths = cast(list[str], logs)
 
         # establish progress
         entity = detail.name if detail else "sample"
         progress_cm = (
-            import_progress(f"reading {entity}s", total=len(logs))
+            import_progress(f"reading {entity}s", total=len(log_paths))
             if progress
             else no_progress()
         )
 
         # run the parallel reads (setup arrays for holding results in order)
-        df_results: list[pd.DataFrame | None] = [None] * len(logs)
-        error_results: list[list[ColumnError] | None] = [None] * len(logs)
+        df_results: list[pd.DataFrame | None] = [None] * len(log_paths)
+        error_results: list[list[ColumnError] | None] = [None] * len(log_paths)
         executor = ProcessPoolExecutor(max_workers=parallel)
         try:
             with progress_cm as p:
                 futures = {
                     executor.submit(
                         _read_samples_df_serial,  # type: ignore[arg-type]
-                        logs=[log],
+                        logs=[log_path],
                         columns=columns,
                         full=full,
                         strict=strict,
                         detail=detail,
                         progress=False,
+                        exclude_fields=exclude_fields,
                     ): idx
-                    for idx, log in enumerate(logs)
+                    for idx, log_path in enumerate(log_paths)
                 }
                 for fut in as_completed(futures):
                     idx = futures[fut]
@@ -198,7 +214,16 @@ def _read_samples_df(
         # recombine df
         df = pd.concat(df_results, ignore_index=True)
         subset = f"{detail.name}_id" if detail else SAMPLE_ID
-        df.drop_duplicates(subset=subset, ignore_index=True, inplace=True)
+        try:
+            df.drop_duplicates(subset=subset, ignore_index=True, inplace=True)
+        except Exception as e:
+            # Check if it's specifically the pyarrow offset overflow error
+            if "offset overflow" in str(e):
+                # Convert to large_string and retry
+                df = _convert_to_large_string(df)
+                df.drop_duplicates(subset=subset, ignore_index=True, inplace=True)
+            else:
+                raise
 
         # recombine errors
         errors: list[ColumnError] = list(
@@ -211,7 +236,7 @@ def _read_samples_df(
         else:
             return df, errors
 
-    # non-parallel
+    # non-parallel (or EvalLog objects which don't benefit from parallel)
     else:
         return _read_samples_df_serial(
             logs=logs,
@@ -220,17 +245,19 @@ def _read_samples_df(
             strict=strict,
             detail=detail,
             progress=progress,
+            exclude_fields=exclude_fields,
         )
 
 
 def _read_samples_df_serial(
-    logs: list[str],
+    logs: list[str] | list[EvalLog],
     columns: Sequence[Column],
     *,
     full: bool = False,
     strict: bool = True,
     detail: MessagesDetail | EventsDetail | None = None,
     progress: bool = True,
+    exclude_fields: set[str] | None = None,
 ) -> "pd.DataFrame" | tuple["pd.DataFrame", list[ColumnError]]:
     # split columns by type
     columns_eval: list[Column] = []
@@ -252,7 +279,7 @@ def _read_samples_df_serial(
             raise ValueError(
                 f"Unexpected column type passed to samples_df: {type(column)}"
             )
-    # resolve duplciates
+    # resolve duplicates
     columns_eval = resolve_duplicate_columns(columns_eval)
     columns_sample = resolve_duplicate_columns(columns_sample)
     columns_detail = resolve_duplicate_columns(columns_detail)
@@ -264,6 +291,9 @@ def _read_samples_df_serial(
 
     # make sure eval_id is present
     columns_eval = list(ensure_eval_data(columns_eval))
+
+    # determine if we have paths or EvalLog objects
+    is_eval_logs = len(logs) > 0 and isinstance(logs[0], EvalLog)
 
     # establish progress
     progress_cm = (
@@ -287,22 +317,39 @@ def _read_samples_df_serial(
         p.reset(description=f"reading {entity}s", completed=0, total=total_samples)
 
         # read samples
-        for eval_id, eval_log in zip(evals_table[EVAL_ID].to_list(), eval_logs):
-            # get a generator for the samples (might require reading the full log
-            # or might be fine to just read the summaries)
-            if require_full_samples:
-                samples: Generator[EvalSample | EvalSampleSummary, None, None] = (
-                    read_eval_log_samples(
-                        eval_log.location,
-                        all_samples_required=False,
-                        resolve_attachments=True,
-                    )
+        async def read_samples_async(
+            eval_id: str, eval_log: EvalLog
+        ) -> Iterable[EvalSample | EvalSampleSummary]:
+            # get samples (in-memory, full log, or summaries from disk)
+            if (
+                is_eval_logs
+                and eval_log.samples is not None
+                and len(eval_log.samples) > 0
+            ):
+                samples: Iterable[EvalSample | EvalSampleSummary] = eval_log.samples
+            elif require_full_samples:
+                full_log = await read_eval_log_async(
+                    eval_log.location,
+                    resolve_attachments=True,
+                    exclude_fields=exclude_fields,
                 )
+                samples = full_log.samples or []
             else:
-                samples = (
-                    summary
-                    for summary in read_eval_log_sample_summaries(eval_log.location)
-                )
+                samples = await read_eval_log_sample_summaries_async(eval_log.location)
+            p.update()
+            return samples
+
+        eval_ids = evals_table[EVAL_ID].to_list() if EVAL_ID in evals_table else []
+        log_samples = run_coroutine(
+            tg_collect(
+                [
+                    partial(read_samples_async, eval_id, eval_log)
+                    for eval_id, eval_log in zip(eval_ids, eval_logs)
+                ]
+            )
+        )
+
+        for samples, eval_id, eval_log in zip(log_samples, eval_ids, eval_logs):
             for sample in samples:
                 if strict:
                     record = import_record(
@@ -324,7 +371,7 @@ def _read_samples_df_serial(
                 # record with ids
                 record = ids | record
 
-                # if there are detail columns then we blow out these records w/ detail
+                # if there are detail columns then blow out w/ detail
                 if detail is not None:
                     # filter detail records
                     assert isinstance(sample, EvalSample)
@@ -345,11 +392,17 @@ def _read_samples_df_serial(
                     for index, item in enumerate(detail_items):
                         if strict:
                             detail_record = import_record(
-                                eval_log, item, columns_detail, strict=True
+                                eval_log,
+                                item,
+                                columns_detail,
+                                strict=True,
                             )
                         else:
                             detail_record, errors = import_record(
-                                eval_log, item, columns_detail, strict=False
+                                eval_log,
+                                item,
+                                columns_detail,
+                                strict=False,
                             )
                             all_errors.extend(errors)
 
@@ -371,7 +424,6 @@ def _read_samples_df_serial(
 
                 # record sample record
                 sample_records.append(record)
-                p.update()
 
     # normalize records and produce samples table
     samples_table = records_to_pandas(sample_records)
@@ -530,3 +582,52 @@ def reorder_samples_df_columns(
 
     # reorder the DataFrame
     return df[ordered_columns]
+
+
+def _convert_to_large_string(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Convert PyArrow string columns to large_string to avoid offset overflow.
+
+    PyArrow's default string type uses 32-bit offsets, which limits total string
+    data to ~2GB. This function converts string columns to large_string (64-bit
+    offsets) to handle larger datasets.
+
+    Only columns that are approaching or exceeding the 2GB limit are converted.
+
+    Args:
+        df: DataFrame with potential PyArrow string columns
+
+    Returns:
+        DataFrame with string columns converted to large_string where needed
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    # 2^31 bytes is the limit for 32-bit offsets
+    # Use a threshold of 1.5GB to catch columns that might be close
+    SIZE_THRESHOLD = int(1.5 * 1024**3)
+
+    # Build a new DataFrame with converted columns
+    new_columns: dict[str, Any] = {}
+    for col in df.columns:
+        # Check if this is a PyArrow-backed column
+        col_dtype = df[col].dtype
+        if hasattr(col_dtype, "pyarrow_dtype"):
+            dtype = col_dtype.pyarrow_dtype  # type: ignore[attr-defined]
+            if pa.types.is_string(dtype):
+                # Check the size of this column's string data
+                col_array = df[col].array
+                if hasattr(col_array, "_pa_array"):
+                    arrow_array = col_array._pa_array  # type: ignore[attr-defined]
+                    # Get the total size of string data in this column
+                    total_size = arrow_array.nbytes
+                    # Only convert if this column is large enough to potentially cause issues
+                    if total_size > SIZE_THRESHOLD:
+                        large_string_array = arrow_array.cast(pa.large_string())
+                        new_columns[col] = pd.arrays.ArrowExtensionArray(  # type: ignore[attr-defined]
+                            large_string_array
+                        )
+                        continue
+        # Keep original column if not converted
+        new_columns[col] = df[col]
+
+    return pd.DataFrame(new_columns, index=df.index)

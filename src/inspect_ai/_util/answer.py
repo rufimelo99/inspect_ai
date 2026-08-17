@@ -16,11 +16,11 @@ def answer_index(char: str) -> int:
 
         'A' -> 0, 'B' -> 1, etc
     """
-    if char.isalpha() or char == "," or char == " ":
+    if char.isalpha():
         return ord(char.upper()) - ord("A")
     elif char.isnumeric():
         return 25 + int(char)
     else:
         raise ValueError(
-            f"Unepxected multiple choice answer: {char} (must be a letter or number)"
+            f"Unexpected multiple choice answer: {char} (must be a letter or number)"
         )

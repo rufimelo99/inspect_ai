@@ -5,21 +5,27 @@ from typing import Any, Iterable, Set, cast
 
 from openai.types.responses import (
     Response,
+    ResponseCodeInterpreterToolCall,
+    ResponseCodeInterpreterToolCallParam,
     ResponseComputerToolCall,
+    ResponseComputerToolCallParam,
     ResponseCustomToolCall,
     ResponseFunctionCallOutputItemListParam,
     ResponseFunctionToolCall,
+    ResponseFunctionToolCallParam,
     ResponseFunctionWebSearch,
+    ResponseFunctionWebSearchParam,
     ResponseInputContentParam,
     ResponseInputFileParam,
     ResponseInputImageParam,
     ResponseInputItemParam,
+    ResponseInputMessageContentListParam,
     ResponseInputTextParam,
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputRefusal,
     ResponseOutputText,
-    ResponseReasoningItem,
+    ResponseToolSearchCall,
     ToolParam,
     WebSearchToolParam,
 )
@@ -39,22 +45,28 @@ from openai.types.responses.response_custom_tool_call_output_param import (
     OutputOutputContentList,
 )
 from openai.types.responses.response_function_web_search import (
-    Action,
-    ActionSearch,
+    Action as WebSearchAction,
+)
+from openai.types.responses.response_input_item_param import McpCall as McpCallParam
+from openai.types.responses.response_input_item_param import (
+    McpListTools as McpListToolsParam,
 )
 from openai.types.responses.response_input_item_param import (
     Message,
+    ToolSearchCall,
 )
 from openai.types.responses.response_output_item import (
     McpCall,
     McpListTools,
     McpListToolsTool,
 )
-from pydantic import TypeAdapter, ValidationError
+from openai.types.responses.tool_param import CodeInterpreter
+from pydantic import TypeAdapter
 from shortuuid import uuid
 
 from inspect_ai._util.content import (
     Content,
+    ContentDocument,
     ContentImage,
     ContentReasoning,
     ContentText,
@@ -80,11 +92,20 @@ from inspect_ai.model._internal import (
     content_internal_tag,
     parse_content_with_internal,
 )
-from inspect_ai.model._model import ModelName
+from inspect_ai.model._model import Model, ModelName
 from inspect_ai.model._model_output import StopReason
 from inspect_ai.model._openai_responses import (
+    RESPONSES_NAMESPACE,
+    RESPONSES_VERBATIM,
+    TOOL_SEARCH_NAME,
+    TOOL_SEARCH_OPTIONS_MARKER,
+    assistant_internal,
+    code_interpreter_to_tool_use,
     content_from_response_input_content_param,
+    is_additional_tools,
+    is_agent_message,
     is_assistant_message_param,
+    is_code_interpreter_tool_param,
     is_computer_call_output,
     is_computer_tool_param,
     is_custom_tool_call_output,
@@ -92,6 +113,8 @@ from inspect_ai.model._openai_responses import (
     is_function_call_output,
     is_function_tool_param,
     is_mcp_tool_param,
+    is_namespace_tool_param,
+    is_response_code_interpreter_call,
     is_response_computer_tool_call,
     is_response_custom_tool_call,
     is_response_function_tool_call,
@@ -102,33 +125,46 @@ from inspect_ai.model._openai_responses import (
     is_response_output_refusal,
     is_response_output_text,
     is_response_reasoning_item,
+    is_response_tool_search_call,
     is_response_web_search_call,
+    is_simple_assistant_message,
     is_tool_choice_function_param,
     is_tool_choice_mcp_param,
+    is_tool_search_output,
+    is_tool_search_tool_param,
     is_web_search_tool_param,
     mcp_call_to_tool_use,
     mcp_list_tools_to_tool_use,
-    read_reasoning_item_param,
+    parse_web_search_action,
     reasoning_from_responses_reasoning,
     responses_extra_body_fields,
     responses_model_usage,
-    responses_reasoning_from_reasoning,
     to_inspect_citation,
+    tool_call_from_openai_tool_search_call,
+    tool_use_to_code_interpreter_param,
     tool_use_to_mcp_call_param,
     tool_use_to_mcp_list_tools_param,
     web_search_to_tool_use,
 )
 from inspect_ai.model._providers._openai_computer_use import (
-    tool_call_arguments_to_action,
+    tool_call_arguments_to_actions,
     tool_call_from_openai_computer_tool_call,
+)
+from inspect_ai.model._reasoning import (
+    parse_content_with_reasoning,
+    reasoning_to_think_tag,
 )
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.tool._tool import Tool
 from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.tool._tool_choice import ToolChoice, ToolFunction
-from inspect_ai.tool._tool_info import ToolInfo
+from inspect_ai.tool._tool_info import INTERNAL_TOOL_TYPE, ToolInfo
 from inspect_ai.tool._tool_params import ToolParams
 from inspect_ai.tool._tool_util import tool_to_tool_info
+from inspect_ai.tool._tools._code_execution import (
+    CodeExecutionProviders,
+    code_execution,
+)
 from inspect_ai.tool._tools._computer._computer import computer
 from inspect_ai.tool._tools._web_search._web_search import (
     WebSearchProviders,
@@ -139,51 +175,130 @@ from inspect_ai.util._json import JSONSchema
 from .util import (
     apply_message_ids,
     bridge_generate,
+    clear_generation_params,
+    relax_tool_choice_for_withheld,
     resolve_generate_config,
     resolve_inspect_model,
+    validate_bridge_media,
+    withheld_bridge_tool,
 )
 
 logger = getLogger(__name__)
 
 
+def _is_openai_responses_provider(model: Model) -> bool:
+    """Whether the resolved model is served by an OpenAI (or OpenAI-derived) provider.
+
+    Matches the literal OpenAI provider and any subclass of ``OpenAIAPI`` (e.g. a
+    custom or pre-deployment provider registered under a different name that speaks
+    the OpenAI Responses wire format). Such providers accept Responses-only
+    features (``tool_search``, custom tools, computer use), so the bridge passes
+    those through rather than dropping them. Falls back to the provider-name check
+    when the OpenAI provider class can't be imported (e.g. SDK not installed).
+    """
+    try:
+        from inspect_ai.model._providers.openai import OpenAIAPI
+    except Exception:
+        return ModelName(model).api == "openai"
+    return isinstance(model.api, OpenAIAPI)
+
+
 async def inspect_responses_api_request_impl(
     json_data: dict[str, Any],
-    web_search: WebSearchProviders,
+    headers: dict[str, str] | None,
+    web_search: WebSearchProviders | None,
+    code_execution: CodeExecutionProviders | None,
     bridge: AgentBridge,
 ) -> Response:
     # resolve model
     bridge_model_name = str(json_data["model"])
-    model = resolve_inspect_model(bridge_model_name)
+    model = resolve_inspect_model(bridge_model_name, bridge.model_aliases, bridge.model)
     model_name = model.api.model_name
-    is_openai = ModelName(model).api == "openai"
+    is_openai = _is_openai_responses_provider(model)
 
     # record parallel tool calls
     parallel_tool_calls = json_data.get("parallel_tool_calls", True)
 
+    # validate computer use compatibility
+    responses_tools: list[ToolParam] = list(json_data.get("tools", []))
+
+    # some CLI agents (e.g. codex >= 0.144) declare their tools via
+    # `additional_tools` input items rather than (or in addition to) the
+    # request's top-level `tools` array. Merge those declarations into the
+    # tool list so the generate() call carries real tools -- otherwise the
+    # model receives no tools at all and cannot emit structured tool calls.
+    input: str | list[ResponseInputItemParam] = json_data["input"]
+    declared_tool_keys = {
+        (tool.get("type"), tool.get("name")) for tool in responses_tools
+    }
+    if isinstance(input, list):
+        for item in input:
+            if isinstance(item, dict) and is_additional_tools(item):
+                for declared in item.get("tools", []) or []:
+                    key = (declared.get("type"), declared.get("name"))
+                    if key not in declared_tool_keys:
+                        declared_tool_keys.add(key)
+                        responses_tools.append(declared)
+
+    has_computer_use = any(is_computer_tool_param(tool) for tool in responses_tools)
+    if has_computer_use and not is_openai:
+        raise RuntimeError(
+            f"computer use with the OpenAI Responses agent bridge requires an "
+            f"OpenAI model, got '{ModelName(model)}'"
+        )
+
     # convert openai tools to inspect tools (don't pass custom tools on to
-    # non openai models as they don't know how to handle them)
-    responses_tools: list[ToolParam] = json_data.get("tools", [])
-    tools = [
-        tool_from_responses_tool(tool, web_search)
-        for tool in responses_tools
-        if is_openai or tool["type"] != "custom"
-    ]
+    # non openai models as they don't know how to handle them). Track which
+    # tool names belong to a namespace so we can restore the `namespace`
+    # field on outgoing ResponseFunctionToolCalls (codex-cli dispatches by
+    # (namespace, name) and would reject calls with a missing namespace).
+    tools: list[ToolInfo | Tool] = []
+    tool_namespaces: dict[str, str] = {}
+    for tool in responses_tools:
+        if not is_openai and tool["type"] == "custom":
+            continue
+        # tool_search passthrough is OpenAI-Responses-only; drop for other targets
+        if not is_openai and is_tool_search_tool_param(tool):
+            continue
+        if is_namespace_tool_param(tool):
+            _harvest_tool_namespaces(tool, tool_namespaces)
+        tools.extend(
+            tools_from_responses_tool(
+                tool, web_search, code_execution, bridge.allow_remote_mcp
+            )
+        )
     tools = [tool for tool in tools if tool]
     responses_tool_choice: ResponsesToolChoiceParam | None = json_data.get(
         "tool_choice", None
     )
-    tool_choice = tool_choice_from_responses_tool_choice(responses_tool_choice)
+    tool_choice = relax_tool_choice_for_withheld(
+        tool_choice_from_responses_tool_choice(responses_tool_choice), tools
+    )
 
-    # convert to inspect messages
-    input: list[ResponseInputItemParam] = json_data["input"]
+    # convert inspect messages (input was read above, before tool merging)
+
+    # deferred namespace tools (e.g. codex multi_agent) are not declared in the
+    # top-level `tools` array; they are discovered via tool_search and appear as
+    # namespace entries inside tool_search_output items in the conversation.
+    # Harvest those too so outgoing function calls carry the right `namespace`.
+    if isinstance(input, list):
+        for item in input:
+            if isinstance(item, dict) and is_tool_search_output(item):
+                for discovered in item.get("tools", []) or []:
+                    if is_namespace_tool_param(discovered):
+                        _harvest_tool_namespaces(discovered, tool_namespaces)
 
     debug_log("SCAFFOLD INPUT", input)
 
     messages = messages_from_responses_input(input, tools, model_name)
+    validate_bridge_media(bridge, messages)
     debug_log("INSPECT MESSAGES", messages)
 
     # extract generate config (hoist instructions into system_message)
     config = generate_config_from_openai_responses(json_data)
+    if not bridge.forward_generation_config:
+        clear_generation_params(config)
+    config.extra_headers = headers
     if config.system_message:
         messages.insert(0, ChatMessageSystem(content=config.system_message))
         config.system_message = None
@@ -195,12 +310,16 @@ async def inspect_responses_api_request_impl(
     config = resolve_generate_config(model, config)
 
     # if there is a bridge filter give it a shot first
-    output = await bridge_generate(bridge, model, messages, tools, tool_choice, config)
+    output, c_message = await bridge_generate(
+        bridge, model, messages, tools, tool_choice, config
+    )
+    if c_message is not None:
+        messages.append(c_message)
 
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    bridge._track_state(messages, output)
+    await bridge._track_state(messages, output)
 
     # return response
     response = Response(
@@ -209,7 +328,9 @@ async def inspect_responses_api_request_impl(
         incomplete_details=responses_incomplete_details(output.stop_reason),
         model=model_name,
         object="response",
-        output=responses_output_items_from_assistant_message(output.message),
+        output=responses_output_items_from_assistant_message(
+            output.message, tool_namespaces
+        ),
         parallel_tool_calls=parallel_tool_calls,
         tool_choice=responses_tool_choice_param_to_tool_choice(responses_tool_choice),
         tools=responses_tool_params_to_tools(responses_tools),
@@ -218,6 +339,64 @@ async def inspect_responses_api_request_impl(
     debug_log("SCAFFOLD RESPONSE", response)
 
     return response
+
+
+def _harvest_tool_namespaces(
+    namespace_tool: Any, tool_namespaces: dict[str, str]
+) -> None:
+    """Map each inner tool name to its namespace (codex dispatches by (namespace, name))."""
+    ns_name = namespace_tool.get("name")
+    if not isinstance(ns_name, str):
+        return
+    for inner in namespace_tool.get("tools", []) or []:
+        inner_name = cast(dict[str, Any], inner).get("name")
+        if isinstance(inner_name, str):
+            tool_namespaces[inner_name] = ns_name
+
+
+def _seed_function_call_namespace(param: ResponseFunctionToolCallParam) -> None:
+    """Cache an inbound namespaced function call for verbatim replay to the real model.
+
+    Only seeds when the call carries a `namespace` and isn't already cached
+    (in-sample generations are cached by the provider with richer detail, so we
+    never clobber those).
+    """
+    namespace = param.get("namespace")
+    if not namespace:
+        return
+    call_id = param["call_id"]
+    cache = assistant_internal().tool_calls
+    if call_id in cache:
+        return
+    cache[call_id] = ResponseFunctionToolCallParam(
+        type="function_call",
+        call_id=call_id,
+        name=param["name"],
+        arguments=param["arguments"],
+        namespace=namespace,
+    )
+
+
+def _seed_tool_search_call(call_id: str, arguments: dict[str, Any]) -> None:
+    """Cache an inbound tool_search call so cross-process replay stays native.
+
+    Within a sample the provider already caches the parsed call; seeding only
+    matters when replaying scaffold-provided history in a fresh process (e.g.
+    codex --resume), so the result replays as a native tool_search_output rather
+    than a function_call_output. The `call_id in cache` guard ensures we never
+    clobber a richer in-sample entry.
+    """
+    cache = assistant_internal().tool_calls
+    if call_id in cache:
+        return
+    cache[call_id] = ToolSearchCall(
+        type="tool_search_call",
+        id=call_id,
+        call_id=call_id,
+        arguments=arguments,
+        execution="client",
+        status="completed",
+    )
 
 
 def debug_log(caption: str, o: Any) -> None:
@@ -252,7 +431,12 @@ def tool_choice_from_responses_tool_choice(
         elif tool_choice.get("type") == "custom":
             raise RuntimeError("ToolChoiceCustomParam not supported by agent bridge")
         elif "type" in tool_choice:
-            inspect_tool_choice = ToolFunction(name=str(tool_choice.get("type")))
+            tool_type = str(tool_choice.get("type"))
+            if tool_type in ["web_search_preview", "web_search_preview_2025_03_11"]:
+                tool_type = "web_search"
+            elif tool_type == "code_interpreter":
+                tool_type = "code_execution"
+            inspect_tool_choice = ToolFunction(name=tool_type)
 
     return inspect_tool_choice
 
@@ -270,13 +454,21 @@ def responses_tool_choice_param_to_tool_choice(
 
 
 def tool_from_responses_tool(
-    tool_param: ToolParam, web_search_providers: WebSearchProviders
-) -> ToolInfo | Tool:
+    tool_param: ToolParam,
+    web_search_providers: WebSearchProviders | None,
+    code_execution_providers: CodeExecutionProviders | None,
+    allow_remote_mcp: bool,
+) -> ToolInfo | Tool | None:
     if is_function_tool_param(tool_param):
+        # stash the original param so the OpenAI Responses provider can re-emit
+        # it verbatim: ToolParams validation is lossy (drops schema extensions
+        # like `encrypted: true`, normalizes `required`) and models with
+        # reserved tool schemas (e.g. codex collaboration tools) reject drift.
         return ToolInfo(
             name=tool_param["name"],
             description=tool_param["description"] or tool_param["name"],
             parameters=ToolParams.model_validate(tool_param["parameters"]),
+            options={RESPONSES_VERBATIM: dict(tool_param)},
         )
     elif is_custom_tool_param(tool_param):
         return ToolInfo(
@@ -286,15 +478,33 @@ def tool_from_responses_tool(
                 properties={"input": JSONSchema(type="string", description="Input.")},
                 required=["input"],
             ),
-            options={"custom_format": tool_param["format"]},
+            options={
+                "custom_format": tool_param["format"],
+                RESPONSES_VERBATIM: dict(tool_param),
+            },
         )
     elif is_web_search_tool_param(tool_param):
+        if web_search_providers is None:
+            withheld_bridge_tool("web_search")
+            return None
         return web_search(
             resolve_web_search_providers(tool_param, web_search_providers)
+        )
+    elif is_code_interpreter_tool_param(tool_param):
+        if code_execution_providers is None:
+            withheld_bridge_tool("code_interpreter")
+            return None
+        return code_execution(
+            providers=resolve_code_interpreter_providers(
+                tool_param, code_execution_providers
+            )
         )
     elif is_computer_tool_param(tool_param):
         return computer()
     elif is_mcp_tool_param(tool_param):
+        if not allow_remote_mcp:
+            withheld_bridge_tool("mcp")
+            return None
         allowed_tools = tool_param["allowed_tools"]
         if isinstance(allowed_tools, dict):
             raise RuntimeError(
@@ -310,10 +520,91 @@ def tool_from_responses_tool(
         return ToolInfo(
             name=f"mcp_server_{config.name}",
             description=f"mcp_server_{config.name}",
-            options=config.model_dump(),
+            options={INTERNAL_TOOL_TYPE: "mcp_call", **config.model_dump()},
+        )
+    elif is_tool_search_tool_param(tool_param):
+        # client-resolved tool discovery (e.g. codex-cli). Preserve the native
+        # tool fields in options so the OpenAI Responses provider can re-emit the
+        # ToolSearchToolParam verbatim; the scaffold resolves the calls locally.
+        return ToolInfo(
+            name=TOOL_SEARCH_NAME,
+            description=tool_param.get("description") or TOOL_SEARCH_NAME,
+            options={
+                TOOL_SEARCH_OPTIONS_MARKER: True,
+                "description": tool_param.get("description"),
+                "execution": tool_param.get("execution"),
+                "parameters": tool_param.get("parameters"),
+            },
         )
     else:
-        raise RuntimeError(f"ToolParam of type {tool_param.get('type')} not supported.")
+        # Unsupported tool type: skip it rather than failing the entire request
+        # so the model can still run with the tools we do support.
+        warn_once(
+            logger,
+            f"ToolParam of type '{tool_param.get('type')}' not supported by the "
+            "agent bridge; ignoring this tool.",
+        )
+        return None
+
+
+def tools_from_responses_tool(
+    tool_param: ToolParam,
+    web_search_providers: WebSearchProviders | None,
+    code_execution_providers: CodeExecutionProviders | None,
+    allow_remote_mcp: bool,
+) -> list[ToolInfo | Tool]:
+    """Convert a responses ToolParam into zero or more inspect tools.
+
+    NamespaceToolParam groups multiple function/custom tools under one
+    logical container; it is flattened into its constituent tools. The
+    enclosing namespace name is tracked separately by the caller and
+    restored on outgoing ResponseFunctionToolCall.namespace so that
+    scaffolds (e.g. codex-cli) which dispatch by (namespace, name) can
+    locate the tool on the return trip.
+    """
+    if is_namespace_tool_param(tool_param):
+        ns_name = tool_param.get("name")
+        ns_desc = tool_param.get("description") or ns_name
+        flattened: list[ToolInfo | Tool] = []
+        for inner in tool_param.get("tools", []):
+            inner_param = cast(ToolParam, inner)
+            inner_tool = tool_from_responses_tool(
+                inner_param,
+                web_search_providers,
+                code_execution_providers,
+                allow_remote_mcp,
+            )
+            if inner_tool is not None:
+                # Stash the namespace so openai_responses_tools can re-group
+                # into a NamespaceToolParam on the outgoing request. Without
+                # this the tool reaches the API flat as functions.<name>,
+                # which OpenAI rejects on models that reserve those names for
+                # encrypted tool use (e.g. codex's multi_agent_v1.spawn_agent).
+                if isinstance(inner_tool, ToolInfo) and ns_name:
+                    inner_tool.options = {
+                        **(inner_tool.options or {}),
+                        RESPONSES_NAMESPACE: (ns_name, ns_desc),
+                    }
+                flattened.append(inner_tool)
+        return flattened
+    tool = tool_from_responses_tool(
+        tool_param, web_search_providers, code_execution_providers, allow_remote_mcp
+    )
+    return [tool] if tool is not None else []
+
+
+def resolve_code_interpreter_providers(
+    tool_param: CodeInterpreter,
+    code_execution: CodeExecutionProviders,
+) -> CodeExecutionProviders:
+    # pass through openai options if there is no special openai config
+    openai_options = code_execution.get("openai", False)
+    if openai_options is True or (
+        isinstance(openai_options, dict) and len(openai_options) == 0
+    ):
+        code_execution["openai"] = {"container": tool_param["container"]}
+
+    return code_execution
 
 
 def resolve_web_search_providers(
@@ -363,11 +654,16 @@ def generate_config_from_openai_responses(json_data: dict[str, Any]) -> Generate
 
     warn_unsupported("background")  # we don't proxy background polling requests
     warn_unsupported("prompt")  # prompt template
-    warn_unsupported("top_logprobs")  # don't have this yet for responses
+
+    # capture include if it exists
+    include = cast(list[str], json_data.get("include", []))
 
     config = GenerateConfig()
     config.system_message = json_data.get("instructions", None)
     config.max_tokens = json_data.get("max_output_tokens", None)
+    if "message.output_text.logprobs" in include:
+        config.logprobs = True
+    config.top_logprobs = json_data.get("top_logprobs", None)
     config.parallel_tool_calls = json_data.get("parallel_tool_calls", None)
     reasoning = json_data.get("reasoning", None)
     if reasoning:
@@ -429,11 +725,82 @@ def messages_from_responses_input(
     pending_assistant_message_params: list[ResponseInputItemParam] = []
 
     def collect_pending_assistant_message() -> None:
+        # codex treats many id fields that are required in the openai sdk types
+        # as optional (https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs#L67)
+        # this is likely correct for store=False (which codex uses by default).
+        # consequently, we provide some ids automatically so that validation succeeds.
+        def ensure_id(
+            param: ResponseFunctionWebSearchParam
+            | ResponseComputerToolCallParam
+            | ResponseCodeInterpreterToolCallParam
+            | McpListToolsParam
+            | McpCallParam
+            | ToolSearchCall,
+            prefix: str = "id",
+        ) -> None:
+            if "id" not in param:
+                param["id"] = f"{prefix}_{uuid()}"
+
         if len(pending_assistant_message_params) > 0:
             content: list[Content] = []
             tool_calls: list[ToolCall] = []
             for param in pending_assistant_message_params:
-                if is_response_output_message(param):
+                # convert simple assistant message to standard format
+                if is_simple_assistant_message(param):
+                    if isinstance(param["content"], str):
+                        param_content: ResponseInputMessageContentListParam = [
+                            ResponseInputTextParam(
+                                text=param["content"], type="input_text"
+                            )
+                        ]
+                    else:
+                        param_content = param["content"]
+                    for c in param_content:
+                        if c["type"] == "input_text":
+                            asst_content, content_internal = (
+                                parse_content_with_internal(
+                                    c["text"], CONTENT_INTERNAL_TAG
+                                )
+                            )
+                            # Check for serialized <think> tags and restore as ContentReasoning
+                            remaining_text, reasoning_capsule = (
+                                parse_content_with_reasoning(asst_content)
+                            )
+                            if reasoning_capsule is not None:
+                                content.append(
+                                    ContentReasoning(
+                                        reasoning=reasoning_capsule.reasoning,
+                                        signature=reasoning_capsule.signature,
+                                        redacted=reasoning_capsule.redacted,
+                                        summary=reasoning_capsule.summary,
+                                        # Preserve the stashed encrypted_content
+                                        # blob so it can be replayed next turn.
+                                        internal=reasoning_capsule.internal,
+                                    )
+                                )
+                                asst_content = remaining_text
+                            if (
+                                asst_content
+                            ):  # Only add text if there's remaining content
+                                content.append(
+                                    ContentText(
+                                        text=asst_content, internal=content_internal
+                                    )
+                                )
+                        elif c["type"] == "input_image" and c["image_url"] is not None:
+                            content.append(
+                                ContentImage(image=c["image_url"], detail=c["detail"])
+                            )
+                        elif c["type"] == "input_file":
+                            content.append(
+                                ContentDocument(
+                                    document=c["file_data"],
+                                    filename=c["filename"],
+                                    # mime_type auto-detected from file_data URI
+                                )
+                            )
+
+                elif is_response_output_message(param):
                     for output in param["content"]:
                         text = str(output.get("text", output.get("refusal", "")))
 
@@ -442,20 +809,40 @@ def messages_from_responses_input(
                         )
 
                         if is_response_output_text(output):
-                            content.append(
-                                ContentText(
-                                    text=asst_content,
-                                    internal=content_internal,
-                                    citations=(
-                                        [
-                                            to_inspect_citation(annotation)
-                                            for annotation in output["annotations"]
-                                        ]
-                                        if output.get("annotations", None)
-                                        else None
-                                    ),
-                                )
+                            # Check for serialized <think> tags and restore as ContentReasoning
+                            remaining_text, reasoning_capsule = (
+                                parse_content_with_reasoning(asst_content)
                             )
+                            if reasoning_capsule is not None:
+                                content.append(
+                                    ContentReasoning(
+                                        reasoning=reasoning_capsule.reasoning,
+                                        signature=reasoning_capsule.signature,
+                                        redacted=reasoning_capsule.redacted,
+                                        summary=reasoning_capsule.summary,
+                                        # Preserve the stashed encrypted_content
+                                        # blob so it can be replayed next turn.
+                                        internal=reasoning_capsule.internal,
+                                    )
+                                )
+                                asst_content = remaining_text
+                            if (
+                                asst_content
+                            ):  # Only add text if there's remaining content
+                                content.append(
+                                    ContentText(
+                                        text=asst_content,
+                                        internal=content_internal,
+                                        citations=(
+                                            [
+                                                to_inspect_citation(annotation)
+                                                for annotation in output["annotations"]
+                                            ]
+                                            if output.get("annotations", None)
+                                            else None
+                                        ),
+                                    )
+                                )
                         elif is_response_output_refusal(output):
                             content.append(
                                 ContentText(
@@ -467,6 +854,14 @@ def messages_from_responses_input(
 
                 elif is_response_function_tool_call(param):
                     function_calls_by_id[param["call_id"]] = param["name"]
+                    # Preserve the call's `namespace` for verbatim replay to the
+                    # real model. The provider replays from assistant_internal
+                    # (keyed by call_id) but only caches calls it generated this
+                    # sample; externally-sourced history (e.g. codex --resume on
+                    # checkpoint restore) arrives with an empty cache, so the
+                    # namespace would otherwise be dropped. Seed the cache here
+                    # when missing so the existing warm-path replay carries it.
+                    _seed_function_call_namespace(param)
                     tool_calls.append(
                         parse_tool_call(
                             id=param["call_id"],
@@ -485,25 +880,45 @@ def messages_from_responses_input(
                     )
                     tool_calls.append(tool_call)
                 elif is_response_computer_tool_call(param):
+                    ensure_id(param)
                     computer_call = ResponseComputerToolCall.model_validate(param)
                     tool_calls.append(
                         tool_call_from_openai_computer_tool_call(computer_call)
                     )
+                elif is_response_tool_search_call(param):
+                    ensure_id(param, "ts")
+                    tool_search_call = ResponseToolSearchCall.model_validate(param)
+                    tool_call = tool_call_from_openai_tool_search_call(tool_search_call)
+                    # record so the following tool_search_output recovers the name
+                    function_calls_by_id[tool_call.id] = TOOL_SEARCH_NAME
+                    # seed the provider cache so replay (incl. fresh-process
+                    # resume) emits native tool_search items, not function calls
+                    _seed_tool_search_call(tool_call.id, tool_call.arguments)
+                    tool_calls.append(tool_call)
 
                 elif is_response_reasoning_item(param):
                     content.append(reasoning_from_responses_reasoning(param))
                 elif is_response_web_search_call(param):
-                    # Workaround for OpenAI server implementation change
-                    # https://github.com/openai/openai-java/issues/526
+                    ensure_id(param, "ws")
+                    # Backwards compat: older SDK data may use "find" instead of
+                    # "find_in_page". https://github.com/openai/openai-java/issues/526
                     action = param["action"]
-                    if action["type"] == "find_in_page":  # type: ignore[comparison-overlap]
-                        action["type"] = "find"
+                    if action["type"] == "find":  # type: ignore[comparison-overlap]
+                        action["type"] = "find_in_page"
                     web_search = ResponseFunctionWebSearch.model_validate(param)
                     content.append(web_search_to_tool_use(web_search))
+                elif is_response_code_interpreter_call(param):
+                    ensure_id(param)
+                    code_execution = ResponseCodeInterpreterToolCall.model_validate(
+                        param
+                    )
+                    content.append(code_interpreter_to_tool_use(code_execution))
                 elif is_response_mcp_list_tools(param):
+                    ensure_id(param)
                     mcp_list_tools = McpListTools.model_validate(param)
                     content.append(mcp_list_tools_to_tool_use(mcp_list_tools))
                 elif is_response_mcp_call(param):
+                    ensure_id(param)
                     mcp_call = McpCall.model_validate(param)
                     content.append(mcp_call_to_tool_use(mcp_call))
                 else:
@@ -533,7 +948,58 @@ def messages_from_responses_input(
         # see if we need to collect a pending assistant message
         collect_pending_assistant_message()
 
-        if is_response_input_message(item):
+        if is_agent_message(item):
+            # Codex Multi-Agent V2 delivers inter-agent messages as input items.
+            # Render an author-attributed user message (Codex's own downgrade
+            # convention, so the recipient never mistakes another agent's words
+            # for the user's) and stash the original item on ContentText.internal
+            # so the OpenAI Responses provider can replay it natively --
+            # encrypted_content parts are undecryptable here but decryptable
+            # by OpenAI server-side. Checked before is_response_input_message
+            # (an exact type match vs. a loose keys-based one) so a future
+            # Codex adding a "role" key to agent_message items can't silently
+            # reroute them into the plain-message branch.
+            agent_message = cast(dict[str, Any], item)
+            author = str(agent_message.get("author") or "agent")
+            agent_message_parts = agent_message.get("content", []) or []
+            text_parts = [
+                part["text"]
+                for part in agent_message_parts
+                if isinstance(part, dict)
+                and part.get("type") == "input_text"
+                and isinstance(part.get("text"), str)
+            ]
+            if not text_parts:
+                if any(
+                    isinstance(part, dict) and part.get("type") == "encrypted_content"
+                    for part in agent_message_parts
+                ):
+                    warn_once(
+                        logger,
+                        "agent_message item carries only encrypted content: it "
+                        "replays natively to OpenAI Responses targets, but other "
+                        "targets see only a placeholder.",
+                    )
+                    text_parts = ["[encrypted content: readable only by OpenAI]"]
+                else:
+                    warn_once(
+                        logger,
+                        "agent_message item carries no readable content: "
+                        "rendering a placeholder.",
+                    )
+                    text_parts = ["[no readable content]"]
+            messages.append(
+                ChatMessageUser(
+                    content=[
+                        ContentText(
+                            text=f"Agent message from {author}:\n"
+                            + "\n".join(text_parts),
+                            internal={"agent_message": agent_message},
+                        )
+                    ]
+                )
+            )
+        elif is_response_input_message(item):
             # normalize item content
             item_content: list[ResponseInputContentParam] = (
                 [ResponseInputTextParam(type="input_text", text=item["content"])]
@@ -584,6 +1050,27 @@ def messages_from_responses_input(
                     content=[ContentImage(image=item["output"]["image_url"])],
                 )
             )
+        elif is_tool_search_output(item):
+            # client-resolved tool discovery result: carry the discovered tools
+            # as JSON in the tool message content (replayed natively by the
+            # OpenAI Responses provider as a tool_search_output item)
+            messages.append(
+                ChatMessageTool(
+                    tool_call_id=item.get("call_id"),
+                    function=TOOL_SEARCH_NAME,
+                    content=to_json_str_safe(item.get("tools", [])),
+                )
+            )
+        elif is_additional_tools(item):
+            # developer-declared tool availability (e.g. codex CLI declaring
+            # its tools via input items for newer OpenAI models, see
+            # https://github.com/UKGovernmentBEIS/inspect_ai/issues/4490).
+            # These declarations are merged into the generate() call's real
+            # tool list by inspect_responses_api_request_impl, so nothing is
+            # added to message history. (Rendering them as text is actively
+            # harmful: some model backends fail on tool-declaration text and
+            # the model cannot call text-declared tools anyway.)
+            pass
         else:
             # ImageGenerationCall
             # ResponseCodeInterpreterToolCallParam
@@ -646,16 +1133,21 @@ def filter_duplicate_assistant_content(
 
 output_item_adapter = TypeAdapter(list[ResponseOutputItem])
 
-action_adapter = TypeAdapter[Action](Action)
-
 mcp_tool_adapter = TypeAdapter(list[McpListToolsTool])
 
 
 def responses_output_items_from_assistant_message(
     message: ChatMessageAssistant,
+    tool_namespaces: dict[str, str] | None = None,
 ) -> list[ResponseOutputItem]:
     output: list[ResponseOutputItem] = []
-    for content in message.content:
+    # normalize message content to list
+    message_content = (
+        [ContentText(text=message.content)]
+        if isinstance(message.content, str)
+        else message.content
+    )
+    for content in message_content:
         if isinstance(content, ContentText):
             # check for content.internal
             if content.internal:
@@ -675,39 +1167,57 @@ def responses_output_items_from_assistant_message(
                         ResponseOutputRefusal(type="refusal", refusal=content_text)
                         if content.refusal
                         else ResponseOutputText(
-                            type="output_text", text=content_text, annotations=[]
+                            type="output_text",
+                            text=content_text,
+                            annotations=[],
+                            logprobs=[],
                         )
                     ],
                     status="completed",
                 )
             )
         elif isinstance(content, ContentReasoning):
-            reasoning = responses_reasoning_from_reasoning(content)
+            # Serialize reasoning as <think> tag with full attributes (signature, redacted, summary)
+            # so it travels through the scaffold as opaque text and can be restored on the way back
+            think_tag = reasoning_to_think_tag(content)
             output.append(
-                ResponseReasoningItem.model_validate(
-                    read_reasoning_item_param(reasoning)
+                ResponseOutputMessage(
+                    type="message",
+                    id=uuid(),
+                    role="assistant",
+                    content=[
+                        ResponseOutputText(
+                            type="output_text",
+                            text=think_tag,
+                            annotations=[],
+                            logprobs=[],
+                        )
+                    ],
+                    status="completed",
                 )
             )
 
         elif isinstance(content, ContentToolUse):
             if content.tool_type == "web_search":
-                # if this originated from responses then the action will validate as
-                # a native OpenAI action -- otherwise just provide a plausible stand-in
-                # (the native model provider e.g. anthropic will have saved its call
-                # keyed by id so that it can replay with the correct fidelity)
-                try:
-                    action = action_adapter.validate_json(content.arguments)
-                except ValidationError:
-                    action = ActionSearch(type="search", query=content.arguments)
-
                 output.append(
                     ResponseFunctionWebSearch(
                         type="web_search_call",
                         id=content.id,
-                        action=action,
+                        action=cast(
+                            WebSearchAction,
+                            parse_web_search_action(content.arguments),
+                        ),
                         status="failed" if content.error else "completed",
                     )
                 )
+            elif content.tool_type == "code_execution":
+                code_interpreter_param = tool_use_to_code_interpreter_param(content)
+                output.append(
+                    ResponseCodeInterpreterToolCall.model_validate(
+                        code_interpreter_param
+                    )
+                )
+
             elif content.name == "mcp_list_tools":
                 # currently this is only ever done by OpenAI Responses so
                 # it is safe to read in a validated way (unlike web search)
@@ -723,9 +1233,21 @@ def responses_output_items_from_assistant_message(
                 ResponseComputerToolCall(
                     id=uuid(),
                     type="computer_call",
-                    action=tool_call_arguments_to_action(tool_call.arguments),
+                    actions=tool_call_arguments_to_actions(tool_call.arguments),
                     call_id=tool_call.id,
                     pending_safety_checks=[],
+                    status="completed",
+                )
+            )
+        elif tool_call.function == TOOL_SEARCH_NAME:
+            # client-resolved tool discovery: hand the call back to the scaffold
+            output.append(
+                ResponseToolSearchCall(
+                    type="tool_search_call",
+                    id=uuid(),
+                    call_id=tool_call.id,
+                    arguments=tool_call.arguments,
+                    execution="client",
                     status="completed",
                 )
             )
@@ -739,12 +1261,14 @@ def responses_output_items_from_assistant_message(
                 )
             )
         else:
+            namespace = (tool_namespaces or {}).get(tool_call.function)
             output.append(
                 ResponseFunctionToolCall(
                     type="function_call",
                     call_id=tool_call.id,
                     name=tool_call.function,
                     arguments=json.dumps(tool_call.arguments),
+                    namespace=namespace,
                 )
             )
 

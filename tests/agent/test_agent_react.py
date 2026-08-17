@@ -202,6 +202,20 @@ def test_react_agent_custom_prompt() -> None:
     )
 
 
+def test_react_default_prompt_encourages_parallel_tools() -> None:
+    # the default assistant prompt should encourage parallel tool calls and no
+    # longer carry the old sequential "send more messages" framing.
+    from inspect_ai.agent._types import PARALLEL_TOOLS_PROMPT
+
+    log = run_react_agent(tools=[addition()])
+    assert log.samples
+    system_msg = next(
+        m for m in log.samples[0].messages if isinstance(m, ChatMessageSystem)
+    )
+    assert PARALLEL_TOOLS_PROMPT in system_msg.text
+    assert "send more messages with additional tool calls" not in system_msg.text
+
+
 def test_react_agent_custom_submit() -> None:
     log = run_react_agent(
         prompt=AgentPrompt(assistant_prompt=AGENT_SYSTEM_MESSAGE), tools=[addition()]
@@ -389,6 +403,102 @@ def test_react_agent_on_continue_null():
     messages = log.samples[0].messages
     assert len(messages) == 7  # on continue should only appear once
     assert messages[-2].text == DEFAULT_CONTINUE_PROMPT.format(submit="submit")
+
+
+def test_react_agent_on_continue_str_with_braces():
+    # an on_continue string containing literal braces (e.g. a JSON example)
+    # must be passed through verbatim — only the documented {submit}
+    # placeholder is substituted, other braces are not str.format() fields.
+    on_continue = 'Call a tool, e.g. {"name": "{submit}", "answer": "..."}'
+    addition_task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=react(tools=[addition()], on_continue=on_continue),
+        scorer=compare_quantities(),
+    )
+    log = eval(
+        addition_task,
+        model=get_model(
+            "mockllm/model",
+            custom_outputs=[
+                ModelOutput.from_content("mockllm/model", "I think it is 2."),
+                ModelOutput.for_tool_call("mockllm/model", "submit", {"answer": "2"}),
+            ],
+        ),
+    )[0]
+    assert log.status == "success"
+    assert log.samples
+    assert log.samples[0].error is None
+    messages = log.samples[0].messages
+    assert messages[-2].text == 'Call a tool, e.g. {"name": "submit", "answer": "..."}'
+
+
+def test_react_agent_on_continue_func_with_braces():
+    # an on_continue callable may echo model output back to the model; literal
+    # braces in that output (model-controlled) must not be treated as
+    # str.format() fields and crash the agent.
+    async def on_continue(state: AgentState) -> bool | str:
+        if not state.output.message.tool_calls:
+            return f'You said "{state.output.completion}". Please call {{submit}}.'
+        return True
+
+    addition_task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target="2")],
+        solver=react(tools=[addition()], on_continue=on_continue),
+        scorer=compare_quantities(),
+    )
+    log = eval(
+        addition_task,
+        model=get_model(
+            "mockllm/model",
+            custom_outputs=[
+                ModelOutput.from_content("mockllm/model", "I refuse. {pwned}"),
+                ModelOutput.for_tool_call("mockllm/model", "submit", {"answer": "2"}),
+            ],
+        ),
+    )[0]
+    assert log.status == "success"
+    assert log.samples
+    assert log.samples[0].error is None
+    messages = log.samples[0].messages
+    assert messages[-2].text == 'You said "I refuse. {pwned}". Please call submit.'
+
+
+def test_react_agent_assistant_prompt_with_braces():
+    # a user-supplied assistant_prompt / submit_prompt may legitimately contain
+    # literal braces (e.g. a JSON output schema). Only the documented {submit}
+    # placeholder is substituted; other braces must be left intact and must
+    # not raise via str.format().
+    assistant_prompt = 'You are helpful. Output {"json": true}. Use {submit} to finish.'
+    log = run_react_agent(
+        prompt=AgentPrompt(assistant_prompt=assistant_prompt),
+        tools=[addition()],
+    )
+    assert log.status == "success"
+    assert log.samples
+    assert log.samples[0].error is None
+    system_msg = next(
+        m for m in log.samples[0].messages if isinstance(m, ChatMessageSystem)
+    )
+    assert '{"json": true}' in system_msg.text
+    assert f"Use {AGENT_SUBMIT_TOOL_NAME} to finish." in system_msg.text
+
+    # also exercise the branch where assistant_prompt has no {submit} so the
+    # separate submit_prompt (with braces of its own) is appended
+    log = run_react_agent(
+        prompt=AgentPrompt(
+            assistant_prompt='Respond with {"done": false} until ready.',
+            submit_prompt='When ready call {submit}() with {"done": true}.',
+        ),
+        tools=[addition()],
+    )
+    assert log.status == "success"
+    assert log.samples
+    assert log.samples[0].error is None
+    system_msg = next(
+        m for m in log.samples[0].messages if isinstance(m, ChatMessageSystem)
+    )
+    assert '{"done": false}' in system_msg.text
+    assert f'call {AGENT_SUBMIT_TOOL_NAME}() with {{"done": true}}.' in system_msg.text
 
 
 def test_react_agent_on_continue_func():
@@ -625,3 +735,211 @@ def test_react_agent_truncation(
     assert sample.scores and len(sample.scores) == 1
     assert (score := sample.scores["includes"])
     assert score.value == "C" if expected_submit else "I"
+
+
+def test_react_agent_retry_refusals_disabled() -> None:
+    """Test that without retry_refusals, 3 consecutive content_filter responses break the loop.
+
+    Without retry_refusals, content_filter responses pass through directly.
+    The agent loop allows up to 3 consecutive content_filter responses before
+    breaking to avoid an infinite loop while giving the model a chance to recover.
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()]),
+        scorer=includes(),
+        message_limit=30,
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # 3 consecutive refusals trigger the break
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help with that.",
+                stop_reason="content_filter",
+            ),
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I still cannot help.",
+                stop_reason="content_filter",
+            ),
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I really cannot help.",
+                stop_reason="content_filter",
+            ),
+            # This output won't be reached
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "2"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.samples
+    # Loop breaks after 3 consecutive content_filter responses
+    model_events = sum(
+        1 for event in log.samples[0].transcript.events if event.event == "model"
+    )
+    assert model_events == 3
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 0
+
+
+def test_react_agent_retry_refusals_success() -> None:
+    """Test that with retry_refusals, refusals are retried within a single generation.
+
+    With retry_refusals=2, up to 2 retry attempts are made within a single
+    _model_generate call. The key difference from no retry_refusals is that
+    the refusal message is NOT added to the conversation - only the successful
+    response is added.
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()], retry_refusals=2),
+        scorer=includes(),
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First attempt within _model_generate: refusal (triggers retry)
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help with that.",
+                stop_reason="content_filter",
+            ),
+            # Second attempt within _model_generate: success
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "2"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 1
+    # With retry_refusals, only the successful response is added to messages
+    # (the refusal is discarded). So we should see only 1 assistant message.
+    assert log.samples
+    assistant_messages = [
+        m for m in log.samples[0].messages if isinstance(m, ChatMessageAssistant)
+    ]
+    assert len(assistant_messages) == 1
+    # The refusal content should NOT be in any message
+    assert not any("cannot help" in m.text for m in assistant_messages)
+
+
+def test_react_agent_retry_refusals_exhausted() -> None:
+    """Test that when retries are exhausted and consecutive threshold hit, loop breaks.
+
+    With retry_refusals=2, each _model_generate call consumes up to 3 outputs
+    (initial + 2 retries). The outer loop allows 3 consecutive content_filter
+    results before breaking. So we need 3 × 3 = 9 refusal outputs total.
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()], retry_refusals=2),
+        scorer=includes(),
+        message_limit=30,
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # 3 outer loop iterations × 3 refusals each (initial + 2 retries)
+            *(
+                ModelOutput.from_content(
+                    model="mockllm/model",
+                    content=f"I cannot help ({i}).",
+                    stop_reason="content_filter",
+                )
+                for i in range(9)
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.samples
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 0
+
+
+def test_react_agent_retry_refusals_no_submit() -> None:
+    """Test retry_refusals with submit=False."""
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()], submit=False, retry_refusals=1),
+        scorer=includes(),
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First attempt: refusal (triggers retry)
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help.",
+                stop_reason="content_filter",
+            ),
+            # Second attempt: success with tool call
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="addition",
+                tool_arguments={"x": 1, "y": 1},
+            ),
+            # Final response
+            ModelOutput.from_content(model="mockllm/model", content="2"),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 1
+
+
+def test_react_agent_retry_refusals_recovery() -> None:
+    """Test that a transient refusal doesn't break the loop.
+
+    The model refuses once then succeeds on the next attempt, verifying
+    that the consecutive content_filter counter resets on success.
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()]),
+        scorer=includes(),
+        message_limit=30,
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First generation: refusal (consecutive_content_filter = 1)
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help with that.",
+                stop_reason="content_filter",
+            ),
+            # Second generation: success with tool call (counter resets to 0)
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "2"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 1

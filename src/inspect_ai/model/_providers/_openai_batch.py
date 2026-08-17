@@ -1,7 +1,6 @@
-import time
-from typing import IO, Any, Generic, Literal, TypedDict, TypeVar
+from typing import IO, Any, Generic, Literal, TypeVar
 
-import httpx
+import httpx2
 import pydantic
 from openai import AsyncOpenAI
 from openai._types import NOT_GIVEN
@@ -9,13 +8,14 @@ from openai.types import Batch as OpenAIBatch
 from openai.types.batch import Errors as OpenAIErrors
 from openai.types.batch_error import BatchError
 from pydantic import BaseModel
-from typing_extensions import override
+from typing_extensions import TypedDict, override
 
 from inspect_ai.model._generate_config import BatchConfig
 from inspect_ai.model._retry import ModelRetryConfig
 
 from .util.batch import (
     Batch,
+    BatchCheckResult,
     BatchRequest,
 )
 from .util.file_batcher import FileBatcher
@@ -150,7 +150,7 @@ class OpenAIBatcher(FileBatcher[ResponseT, CompletedBatchInfo], Generic[Response
         else:
             return request_id, (
                 self._openai_client._make_status_error_from_response(  # pyright: ignore[reportPrivateUsage]
-                    httpx.Response(status_code=error["code"], text=error["message"])
+                    httpx2.Response(status_code=error["code"], text=error["message"])
                 )
             )
 
@@ -159,7 +159,7 @@ class OpenAIBatcher(FileBatcher[ResponseT, CompletedBatchInfo], Generic[Response
     @override
     async def _check_batch(
         self, batch: Batch[ResponseT]
-    ) -> tuple[int, int, int, (CompletedBatchInfo | None)]:
+    ) -> BatchCheckResult[CompletedBatchInfo]:
         batch_info = self._adapt_batch_info(
             await self._openai_client.batches.retrieve(batch.id)
         )
@@ -170,7 +170,12 @@ class OpenAIBatcher(FileBatcher[ResponseT, CompletedBatchInfo], Generic[Response
             await self._resolve_inflight_batch(
                 batch, self._results_from_rejection(batch, batch_info.errors)
             )
-            return (0, 0, 0, None)
+            return BatchCheckResult(
+                completed_count=0,
+                failed_count=0,
+                created_at=batch_info.created_at,
+                completion_info=None,
+            )
 
         # TODO: Is it bogus to return 0, 0 when request_counts isn't available
         completed, failed = (
@@ -179,10 +184,13 @@ class OpenAIBatcher(FileBatcher[ResponseT, CompletedBatchInfo], Generic[Response
             else (0, 0)
         )
 
-        age = int(time.time() - batch_info.created_at) if batch_info.created_at else 0
-
         if batch_info.status not in {"completed", "failed", "cancelled", "expired"}:
-            return (completed, failed, age, None)
+            return BatchCheckResult(
+                completed_count=completed,
+                failed_count=failed,
+                created_at=batch_info.created_at,
+                completion_info=None,
+            )
 
         # The doc suggests that `output_file_id` will only be populated if the batch
         # as a whole reached the `completed` state. This means that if all but
@@ -195,11 +203,11 @@ class OpenAIBatcher(FileBatcher[ResponseT, CompletedBatchInfo], Generic[Response
             if file_id is not None
         ]
 
-        return (
-            completed,
-            failed,
-            age,
-            {"result_uris": batch_file_ids} if batch_file_ids else None,
+        return BatchCheckResult(
+            completed_count=completed,
+            failed_count=failed,
+            created_at=batch_info.created_at,
+            completion_info={"result_uris": batch_file_ids} if batch_file_ids else None,
         )
 
     # Protected - subclasses can override

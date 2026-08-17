@@ -7,6 +7,7 @@ from inspect_ai._util._async import run_coroutine
 from inspect_ai._util.error import PrerequisiteError
 from inspect_ai._util.file import exists, filesystem
 from inspect_ai.log import resolve_sample_attachments
+from inspect_ai.log._condense import condense_sample
 from inspect_ai.log._file import (
     log_files_from_ls,
     read_eval_log,
@@ -15,6 +16,7 @@ from inspect_ai.log._file import (
 )
 from inspect_ai.log._recorders import create_recorder_for_location
 from inspect_ai.log._recorders.create import recorder_type_for_location
+from inspect_ai.log._resolve import resolve_sample_events_data
 
 
 def convert_eval_logs(
@@ -22,13 +24,12 @@ def convert_eval_logs(
     to: Literal["eval", "json"],
     output_dir: str,
     overwrite: bool = False,
-    resolve_attachments: bool = False,
+    resolve_attachments: bool | Literal["full", "core"] = False,
     stream: int | bool = False,
 ) -> None:
     """Convert between log file formats.
 
-    Convert log file(s) to a target format. If a file is already in the target
-    format it will just be copied to the output dir.
+    Convert log file(s) to a target format.
 
     Args:
         path (str): Path to source log file(s). Should be either a single
@@ -94,10 +95,8 @@ def convert_eval_logs(
                 )
             )
         else:
-            write_eval_log(
-                read_eval_log(input_file, resolve_attachments=resolve_attachments),
-                output_file,
-            )
+            log = read_eval_log(input_file, resolve_attachments=resolve_attachments)
+            write_eval_log(log, output_file)
 
     if fs.info(path).type == "file":
         convert_file(path)
@@ -118,24 +117,38 @@ async def _stream_convert_file(
     input_file: str,
     output_file: str,
     output_dir: str,
-    resolve_attachments: bool,
-    stream: int | bool,
+    resolve_attachments: bool | Literal["full", "core"],
+    stream: int | Literal[True],
 ) -> None:
     input_recorder = recorder_type_for_location(input_file)
     output_recorder = create_recorder_for_location(output_file, output_dir)
 
     sample_map = await input_recorder.read_log_sample_ids(input_file)
-    semaphore = anyio.Semaphore(len(sample_map) if stream is True else stream)
+
+    concurrent_limit = len(sample_map) if stream is True else stream
+    semaphore = anyio.Semaphore(concurrent_limit)
+    samples_processed = 0
 
     async def _convert_sample(sample_id: str | int, epoch: int) -> None:
         async with semaphore:
             sample = await input_recorder.read_log_sample(input_file, sample_id, epoch)
             if resolve_attachments:
-                sample = resolve_sample_attachments(sample)
+                sample = resolve_sample_attachments(sample, resolve_attachments)
+            else:
+                # Must resolve message pool refs before re-condensing,
+                # otherwise condense_sample will overwrite pools with empty lists
+                sample = resolve_sample_events_data(sample)
+            sample = condense_sample(sample)
             await output_recorder.log_sample(
                 log_header.eval,
                 sample,
             )
+
+            nonlocal samples_processed
+            samples_processed += 1
+            # Flush periodically to avoid too much buffering
+            if samples_processed % concurrent_limit == 0:
+                await output_recorder.flush(log_header.eval)
 
     log_header = await read_eval_log_async(
         input_file, header_only=True, resolve_attachments=resolve_attachments
@@ -153,4 +166,7 @@ async def _stream_convert_file(
         log_header.stats,
         log_header.results,
         log_header.reductions,
+        invalidated=log_header.invalidated,
+        log_updates=log_header.log_updates,
+        config_updates=log_header.config_updates,
     )

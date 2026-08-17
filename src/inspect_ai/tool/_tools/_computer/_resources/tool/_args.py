@@ -16,6 +16,11 @@ def _create_parser() -> ArgumentParser:
         aliases=["cursor_position", "left_mouse_down", "left_mouse_up"],
     )
 
+    subparsers.add_parser("open_web_browser")
+
+    navigate = subparsers.add_parser("navigate")
+    _add_text(navigate)
+
     key_and_type = subparsers.add_parser("type", aliases=["key"])
     _add_text(key_and_type)
 
@@ -47,6 +52,9 @@ def _create_parser() -> ArgumentParser:
     wait = subparsers.add_parser("wait")
     _add_duration(wait)
 
+    zoom = subparsers.add_parser("zoom")
+    _add_region(zoom)
+
     return parser
 
 
@@ -76,3 +84,7 @@ def _add_duration(subparser: ArgumentParser) -> Action:
 
 def _add_text(subparser: ArgumentParser, required: bool = True) -> Action:
     return subparser.add_argument("--text", type=str, required=required)
+
+
+def _add_region(subparser: ArgumentParser) -> Action:
+    return subparser.add_argument("--region", type=int, nargs=4, required=True)

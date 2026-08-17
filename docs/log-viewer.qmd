@@ -1,5 +1,6 @@
 ---
 title: Log Viewer 
+llms-description: How to use Inspect View to develop and debug evaluations, including how to provide additional log metadata and integrate it with Python logging.
 ---
 
 ## Overview
@@ -34,13 +35,55 @@ By default, `inspect view` will use the configured log directory of the environm
 $ inspect view --log-dir ./experiment-logs
 ```
 
-By default it will run on port 7575 (and kill any existing `inspect view` using that port). If you want to run two instances of `inspect view` you can specify an alternate port:
+By default it will run locally (`127.0.0.1`) on port 7575 (and kill any existing `inspect view` using that port). If you want to run two instances of `inspect view` you can specify an alternate port:
 
 ``` bash
 $ inspect view --log-dir ./experiment-logs --port 6565
 ```
 
 You only need to run `inspect view` once at the beginning of a session (as it will automatically update to show new evaluations when they are run).
+
+### Remote Access
+
+For single-user access to a viewer on a remote machine, keep the viewer bound to loopback and use SSH port forwarding:
+
+``` bash
+$ ssh -L 7575:127.0.0.1:7575 user@remote
+```
+
+Run `inspect view` normally on the remote machine, then open `http://127.0.0.1:7575` locally.
+
+If local DNS or a hosts file maps a custom name to loopback, declare that exact browser origin:
+
+``` bash
+$ inspect view --trusted-origin http://my-inspect:7575
+```
+
+The viewer remains bound to `127.0.0.1`. `--trusted-origin` is repeatable and accepts exact `http` or `https` origins only; it also permits the matching HTTP `Host`. Unconfigured aliases remain rejected.
+
+Binding beyond loopback requires request authorization. For browser access, place the viewer behind an authenticating reverse proxy that injects the configured upstream authorization header:
+
+``` bash
+$ INSPECT_VIEW_AUTHORIZATION_TOKEN="$UPSTREAM_SECRET" \
+    inspect view \
+    --host 0.0.0.0 \
+    --trusted-origin https://inspect.example.org
+```
+
+Load `UPSTREAM_SECRET` through your normal secret-management mechanism and set it to the complete expected `Authorization` header value (for example, `Bearer ...`). The proxy must authenticate the external user, preserve the configured public `Host`, set the public request scheme from a trusted proxy address, remove any client-supplied copy of the upstream authorization header, and inject the configured value. A browser pointed directly at an authorization-protected viewer cannot add this header to its initial navigation.
+
+Unauthenticated network exposure remains available only through an explicit acknowledgement:
+
+``` bash
+$ inspect view \
+    --host 0.0.0.0 \
+    --trusted-origin "http://$MACHINE_IP:7575" \
+    --unsafe-allow-unauthenticated
+```
+
+This permits any network client that can reach the address to call viewer APIs. Exact Host and browser-origin validation and framing protection remain active. `--trusted-host` may add an exact authority for a non-browser client or health check, but does not authorize a browser origin. Hosting the frontend and API on different origins is not supported.
+
+The frontend's `X-Inspect-View-Request` marker distinguishes its mutation requests from passive browser resource loads. It is public defense in depth, not authorization or a same-origin secret.
 
 ### Log History
 
@@ -209,6 +252,14 @@ Use `tail --follow` to track the contents of the log file in realtime. For examp
 tail --follow /tmp/inspect.log
 ```
 
+### Logger Format
+
+Console logger output can be formatted using `rich` (ANSI), `plain` (non-ANSI), or `json` formatters. You might want to use `plain` or `json` for single-line logs in non-TTY CI, containers, and log aggregators. To do this, use the `INSPECT_PY_LOGGER_FORMAT` environment variable:
+
+``` bash
+export INSPECT_PY_LOGGER_FORMAT=plain
+```
+
 ## Task Information
 
 The **Info** panel of the log viewer provides additional meta-information about evaluation tasks, including dataset, solver, and scorer details, git revision, and model token usage:
@@ -253,6 +304,28 @@ logs-www
 4.  The logs to be displayed
 
 Deploy this folder to a static webserver to publish the log viewer.
+
+### HuggingFace Spaces
+
+You can publish your bundled log viewer directly to [HuggingFace Spaces](https://huggingface.co/spaces) by specifying an output directory that starts with `hf/`. For example, to publish to a space named `my-org/my-eval-logs`:
+
+``` bash
+$ inspect view bundle --log-dir logs --output-dir hf/my-org/my-eval-logs
+```
+
+The space will be created as a static space and your logs will be immediately available at `https://huggingface.co/spaces/my-org/my-eval-logs`. By default, the space will be created as private. To create a public space, you can use the Python API:
+
+``` python
+from inspect_ai.log import bundle_log_dir
+
+bundle_log_dir(
+    log_dir="logs",
+    output_dir="hf/my-org/my-eval-logs",
+    fs_options={"private": False}
+)
+```
+
+Note that publishing to HuggingFace Spaces requires the `huggingface_hub` package and authentication with HuggingFace (via `huggingface-cli login` or the `HF_TOKEN` environment variable).
 
 ### Other Notes {.unlisted}
 

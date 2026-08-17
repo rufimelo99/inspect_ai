@@ -1,11 +1,13 @@
 ---
-title: "inspect_ai.model"
+reference: inspect_ai.model
+description: Model interface and providers.
 ---
 
 ## Generation
 
 ### get_model
 ### Model
+### ModelRole
 ### GenerateConfig
 ### GenerateConfigArgs
 ### GenerateFilter
@@ -18,6 +20,9 @@ title: "inspect_ai.model"
 ### ModelUsage
 ### StopReason
 ### ChatCompletionChoice
+### OutputModality
+### ImageOutput
+### RetryDecision
 
 ## Messages
 
@@ -29,6 +34,7 @@ title: "inspect_ai.model"
 ### ChatMessageTool
 ### trim_messages
 ### user_prompt
+### stable_message_ids
 
 ## Content
 
@@ -55,6 +61,27 @@ title: "inspect_ai.model"
 ### execute_tools
 ### ExecuteToolsResult
 
+## Compaction
+
+### compaction
+### Compact
+### CompactionStrategy
+### CompactionAuto
+### CompactionNative
+### CompactionEdit
+### CompactionSummary
+### CompactionTrim
+
+
+## Model Info
+
+### get_model_info
+### set_model_info
+### set_model_cost
+### ModelInfo
+### ModelCost
+### model_roles
+
 ## Logprobs
 
 ### Logprob
@@ -72,8 +99,15 @@ title: "inspect_ai.model"
 
 ## Conversion
 
-### messages_to_openai
 ### messages_from_openai
+### messages_from_openai_responses
+### messages_from_anthropic
+### messages_from_google
+### model_output_from_openai
+### model_output_from_openai_responses
+### model_output_from_anthropic
+### model_output_from_google
+### messages_to_openai
 
 ## Provider
 

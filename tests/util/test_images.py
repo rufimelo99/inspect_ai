@@ -5,6 +5,7 @@ from test_helpers.utils import (
     skip_if_no_google,
     skip_if_no_grok,
     skip_if_no_mistral,
+    skip_if_no_moonshot,
     skip_if_no_openai,
 )
 
@@ -51,14 +52,19 @@ def test_openai_responses_images():
 
 @skip_if_no_anthropic
 def test_anthropic_images():
-    check_images("anthropic/claude-3-sonnet-20240229")
+    check_images("anthropic/claude-sonnet-4-5")
 
 
 @skip_if_no_mistral
 def test_mistral_images():
-    check_images("mistral/pixtral-12b-2409")
+    check_images("mistral/mistral-small-latest")
 
 
 @skip_if_no_grok
 def test_grok_images():
-    check_images("grok/grok-2-vision")
+    check_images("grok/grok-imagine-image")
+
+
+@skip_if_no_moonshot
+def test_moonshot_images():
+    check_images("moonshot/kimi-k3")

@@ -1,3 +1,4 @@
+from contextvars import ContextVar
 from typing import Tuple
 
 import rich
@@ -8,11 +9,23 @@ from rich.text import Text
 
 from inspect_ai._util.constants import CONSOLE_DISPLAY_WIDTH
 from inspect_ai._util.path import cwd_relative_path
-from inspect_ai._util.registry import registry_unqualified_name
+from inspect_ai._util.task import task_display_name
 from inspect_ai.util._display import display_type_plain
 
 from .display import TaskProfile
 from .rich import is_vscode_notebook, rich_theme
+
+_eval_set_id_display_var: ContextVar[str | None] = ContextVar(
+    "_eval_set_id_display", default=None
+)
+
+
+def set_eval_set_id_display(value: str | None) -> None:
+    _eval_set_id_display_var.set(value)
+
+
+def get_eval_set_id_display() -> str | None:
+    return _eval_set_id_display_var.get(None)
 
 
 def task_panel(
@@ -181,16 +194,21 @@ def to_renderable(item: RenderableType | str, style: str = "") -> RenderableType
 
 
 def tasks_title(completed: int, total: int) -> str:
-    return f"{completed}/{total} tasks complete"
+    title = f"{completed}/{total} tasks complete"
+    if eval_set_id := get_eval_set_id_display():
+        title = f"[{eval_set_id}] {title}"
+    return title
 
 
 def task_title(profile: TaskProfile, show_model: bool) -> str:
     eval_epochs = profile.eval_config.epochs or 1
     epochs = f" x {profile.eval_config.epochs}" if eval_epochs > 1 else ""
     samples = f"{profile.samples // eval_epochs:,}{epochs} sample{'s' if profile.samples != 1 else ''}"
-    title = f"{registry_unqualified_name(profile.name)} ({samples})"
+    title = f"{task_display_name(profile.name)} ({samples})"
     if show_model:
         title = f"{title}: {profile.model}"
+    if eval_set_id := get_eval_set_id_display():
+        title = f"[{eval_set_id}] {title}"
     return title
 
 

@@ -1,41 +1,55 @@
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator
 
 import rich
 from rich.console import Console, ConsoleOptions, RenderResult
-from rich.markdown import CodeBlock, Markdown
 from rich.segment import Segment
 from rich.syntax import Syntax
 from typing_extensions import override
 
 from inspect_ai._util.platform import is_running_in_jupyterlab, is_running_in_vscode
 from inspect_ai._util.transcript import transcript_code_theme
-from inspect_ai.util._display import display_type, display_type_plain
+from inspect_ai.util._display import DisplayType, display_type, display_type_plain
 
 
 def is_vscode_notebook(console: Console) -> bool:
     return console.is_jupyter and is_running_in_vscode()
 
 
-def rich_no_color() -> bool:
-    return (
-        display_type_plain() or not is_running_in_vscode() or is_running_in_jupyterlab()
-    )
+def rich_no_color(plain: bool) -> bool:
+    return plain or not is_running_in_vscode() or is_running_in_jupyterlab()
 
 
-def rich_initialise() -> None:
+def rich_initialise(
+    display: DisplayType | None = None, plain: bool | None = None
+) -> None:
+    # default args
+    display = display if display is not None else display_type()
+    plain = plain if plain is not None else display_type_plain()
+    size_kwargs = _dumb_terminal_size_kwargs()
+
     # reflect ansi prefs
-    if display_type_plain():
-        rich.reconfigure(no_color=True, force_terminal=False, force_interactive=False)
-    elif rich_no_color():
-        rich.reconfigure(no_color=True)
+    if plain:
+        rich.reconfigure(
+            no_color=True,
+            force_terminal=False,
+            force_interactive=False,
+            **size_kwargs,
+        )
+    elif rich_no_color(plain):
+        rich.reconfigure(no_color=True, **size_kwargs)
+    elif size_kwargs:
+        rich.reconfigure(**size_kwargs)
 
     # reflect display == none
-    if display_type() == "none":
+    if display == "none":
         rich.reconfigure(quiet=True)
 
     # consistent markdown code bock background
+    from rich.markdown import CodeBlock, Markdown
+
     class CustomCodeBlock(CodeBlock):
         @override
         def __rich_console__(
@@ -54,6 +68,28 @@ def rich_initialise() -> None:
 
     Markdown.elements["fence"] = CustomCodeBlock
     Markdown.elements["code_block"] = CustomCodeBlock
+
+
+def _dumb_terminal_size_kwargs() -> dict[str, int]:
+    if os.environ.get("TERM") != "dumb":
+        return {}
+
+    columns = _positive_int_env("COLUMNS")
+    if columns is None:
+        return {}
+
+    return {
+        "width": columns,
+        "height": _positive_int_env("LINES") or 25,
+    }
+
+
+def _positive_int_env(name: str) -> int | None:
+    try:
+        value = int(os.environ[name])
+    except (KeyError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 @dataclass

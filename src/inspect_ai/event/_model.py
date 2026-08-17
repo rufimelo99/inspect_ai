@@ -3,6 +3,7 @@ from typing import Literal
 
 from pydantic import Field, field_serializer
 
+from inspect_ai._util.dateutil import UtcDatetime, datetime_to_iso_format_safe
 from inspect_ai.model._chat_message import ChatMessage
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_call import ModelCall
@@ -11,6 +12,43 @@ from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_info import ToolInfo
 
 from ._base import BaseEvent
+
+OPERATOR_CANCEL_ERROR = "Cancelled by operator"
+"""Sentinel string stamped on ``ModelEvent.error`` when an external
+operator (e.g. ``AcpTransport.cancel_current_turn``) cancels an in-flight
+``generate`` call. Read sites:
+
+- ``inspect_ai.model._model.complete()`` short-circuits its
+  natural-completion overwrite when the event already carries this
+  marker (the model can return successfully inside the cancellation
+  propagation window).
+- TUI / log renderers can suppress display of cancelled events.
+
+The value is intentionally a fixed string so it round-trips through
+the JSON eval log; downstream tooling can detect operator cancels
+without depending on the agent/ACP layer.
+"""
+
+LIMIT_CANCEL_ERROR = "Cancelled by limit"
+"""Sentinel for cancels triggered by a sample-level limit (tokens,
+time, cost, messages). Sibling of :data:`OPERATOR_CANCEL_ERROR` —
+same sticky-stamp + display-suppress contract, but provenance is
+clearly a limit trip rather than an operator action. Pairs with
+``InterruptEvent.source="limit"``."""
+
+SYSTEM_CANCEL_ERROR = "Cancelled by system"
+"""Sentinel for cancels triggered by the eval system (shutdown,
+external orchestration). Sibling of :data:`OPERATOR_CANCEL_ERROR` —
+same sticky-stamp + display-suppress contract, but provenance is
+the eval host rather than the operator. Pairs with
+``InterruptEvent.source="system"``."""
+
+CANCEL_ERRORS: frozenset[str] = frozenset(
+    {OPERATOR_CANCEL_ERROR, LIMIT_CANCEL_ERROR, SYSTEM_CANCEL_ERROR}
+)
+"""All cancel sentinels. Use ``event.error in CANCEL_ERRORS`` in
+renderers / consumers that should treat every cancel cause the same
+way (e.g. suppressing display of an interrupted generation)."""
 
 
 class ModelEvent(BaseEvent):
@@ -27,6 +65,9 @@ class ModelEvent(BaseEvent):
 
     input: list[ChatMessage]
     """Model input (list of messages)."""
+
+    input_refs: list[tuple[int, int]] | None = Field(default=None)
+    """Message pool references for input. Each element is a (start, end_exclusive) range."""
 
     tools: list[ToolInfo]
     """Tools available to the model."""
@@ -46,13 +87,19 @@ class ModelEvent(BaseEvent):
     error: str | None = Field(default=None)
     """Error which occurred during model call."""
 
+    traceback: str | None = Field(default=None)
+    """Error traceback (plain text)."""
+
+    traceback_ansi: str | None = Field(default=None)
+    """Error traceback with ANSI color codes for display."""
+
     cache: Literal["read", "write"] | None = Field(default=None)
     """Was this a cache read or write."""
 
     call: ModelCall | None = Field(default=None)
     """Raw call made to model API."""
 
-    completed: datetime | None = Field(default=None)
+    completed: UtcDatetime | None = Field(default=None)
     """Time that model call completed (see `timestamp` for started)"""
 
     working_time: float | None = Field(default=None)
@@ -62,4 +109,4 @@ class ModelEvent(BaseEvent):
     def serialize_completed(self, dt: datetime | None) -> str | None:
         if dt is None:
             return None
-        return dt.astimezone().isoformat()
+        return datetime_to_iso_format_safe(dt)

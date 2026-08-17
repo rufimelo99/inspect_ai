@@ -4,7 +4,7 @@ from logging import getLogger
 from typing import Any, Iterator, Mapping, Type
 
 import jsonref  # type: ignore
-from jsonpath_ng import Fields, Index, JSONPath, Slice, Where, WhereNot  # type: ignore
+from jsonpath_ng import Fields, Index, JSONPath, Slice, Where  # type: ignore
 from jsonpath_ng.ext.filter import Filter  # type: ignore
 from pydantic import BaseModel
 
@@ -120,7 +120,7 @@ def iter_tokens(node: JSONPath) -> Iterator[str | int | None]:
     elif isinstance(node, Fields):
         yield from node.fields  # e.g. ["foo"]
     elif isinstance(node, Index):
-        yield node.index  # 0  /  -1  /  None for wildcard
+        yield node.indices[0]  # 0 / -1
     elif isinstance(node, Slice):
         yield None  # treat any slice as wildcard
 
@@ -143,8 +143,7 @@ def _expand_union(sch: Schema) -> list[Schema]:
 UNSUPPORTED: tuple[type[JSONPath], ...] = (
     Filter,  # [?foo > 0]
     Where,  # .foo[(@.bar < 42)]
-    WhereNot,
-    Slice,  # [1:5]  (wildcard “[*]” is Index/None, not Slice)
+    Slice,  # [1:5]  (wildcard "[*]" is Index/None, not Slice)
 )
 
 

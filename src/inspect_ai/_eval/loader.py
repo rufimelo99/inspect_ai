@@ -1,7 +1,9 @@
 import ast
 import contextlib
+import copy
 import inspect
 import os
+from dataclasses import replace
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Callable, Tuple, cast
@@ -9,7 +11,7 @@ from typing import Any, Callable, Tuple, cast
 from shortuuid import uuid
 
 from inspect_ai._eval.task.resolved import ResolvedTask
-from inspect_ai._eval.task.util import task_file, task_run_dir
+from inspect_ai._eval.task.util import split_spec, task_file, task_run_dir
 from inspect_ai._util.decorator import parse_decorators
 from inspect_ai._util.error import PrerequisiteError
 from inspect_ai._util.logger import warn_once
@@ -17,31 +19,55 @@ from inspect_ai._util.module import load_module
 from inspect_ai._util.path import chdir_python, cwd_relative_path
 from inspect_ai._util.registry import (
     RegistryInfo,
+    create_registry_object,
     is_registry_object,
-    registry_create,
     registry_info,
     registry_lookup,
     registry_params,
 )
+from inspect_ai.agent._agent import Agent
 from inspect_ai.agent._as_solver import as_solver
 from inspect_ai.model import Model
+from inspect_ai.scorer._metric import Metric, MetricSpec, metric_create
 from inspect_ai.scorer._scorer import Scorer, ScorerSpec, scorer_create
 from inspect_ai.solver._bridge import bridge
+from inspect_ai.solver._constants import SOLVER_ALL_PARAMS_ATTR
 from inspect_ai.solver._solver import Solver, SolverSpec
 from inspect_ai.util import SandboxEnvironmentSpec, SandboxEnvironmentType
+from inspect_ai.util._checkpoint._layout import (
+    eval_checkpoints_dir_from_config,
+)
+from inspect_ai.util._checkpoint.config import CheckpointConfig
+from inspect_ai.util._sandbox.compose import (
+    is_docker_compatible_config,
+    is_docker_compatible_sandbox_type,
+)
 from inspect_ai.util._sandbox.environment import (
     resolve_sandbox_environment,
 )
 from inspect_ai.util._sandbox.registry import registry_find_sandboxenv
 
 from .list import task_files
-from .registry import task_create
+from .registry import task_create, task_source_create
 from .task import PreviousTask, Task, TaskInfo
 from .task.constants import TASK_FILE_ATTR, TASK_RUN_DIR_ATTR
+from .task.hf import task_create_from_hf
 from .task.run import eval_log_sample_source
+from .task.task_source import TaskSource
 from .task.tasks import Tasks
 
 logger = getLogger(__name__)
+
+
+def _merge_model_roles(
+    *roles_dicts: dict[str, Model] | None,
+) -> dict[str, Model] | None:
+    """Merge model_roles dicts with later dicts taking priority."""
+    merged: dict[str, Model] = {}
+    for d in roles_dicts:
+        if d:
+            merged.update(d)
+    return merged or None
 
 
 def resolve_tasks(
@@ -51,7 +77,25 @@ def resolve_tasks(
     model_roles: dict[str, Model] | None,
     sandbox: SandboxEnvironmentType | None,
     sample_shuffle: bool | int | None,
+    eval_checkpoint: CheckpointConfig | None = None,
+    warn_unconsumed_task_args: bool = False,
 ) -> list[ResolvedTask]:
+    # A TaskSource drives a run dynamically and is handled by eval() (which
+    # resolves its initial_tasks() and pulls next_tasks()); it isn't a concrete,
+    # resumable task list, so it can't be used here (eval_set / eval_retry /
+    # score). Detect both a passed instance and a spec/name that refers to one
+    # so the CLI (`inspect eval-set file.py@source`) gets the same clear error
+    # rather than a confusing "task not found".
+    if refers_to_task_source(tasks):
+        raise ValueError(
+            "A TaskSource is only supported by `eval()` / `inspect eval`. "
+            "eval_set, eval_retry, and score require a fixed, resumable set of "
+            "tasks, but a TaskSource generates tasks dynamically (via "
+            "next_tasks() / sample_complete) that have no stable identity to "
+            "track, retry, or resume. Run a TaskSource-driven eval with "
+            "`inspect eval` instead."
+        )
+
     def as_resolved_tasks(tasks: list[Task]) -> list[ResolvedTask]:
         # shuffle data in tasks if requested
         if sample_shuffle:
@@ -68,83 +112,59 @@ def resolve_tasks(
                 task_args=resolve_task_args(task),
                 task_file=task_file(task, relative=True),
                 model=task.model or model,
-                model_roles=task.model_roles or model_roles,
+                model_roles=_merge_model_roles(task.model_roles, model_roles),
                 sandbox=resolve_task_sandbox(task, sandbox),
+                checkpoint=task.checkpoint,
                 sequence=sequence,
             )
             for sequence, task in enumerate(tasks)
         ]
 
-    # reflect resolved tasks right back
-    if isinstance(tasks, ResolvedTask):
-        return [tasks]
-    elif isinstance(tasks, list) and isinstance(tasks[0], ResolvedTask):
-        return cast(list[ResolvedTask], tasks)
-
-    # take empty lists out of play
+    # an empty list is equivalent to None (load tasks from cwd) — but it
+    # must short-circuit before any tasks[0] access below
     if isinstance(tasks, list) and len(tasks) == 0:
         return as_resolved_tasks(load_tasks(None, task_args))
 
-    # simple cases of passing us Task objects
-    if isinstance(tasks, Task):
-        return as_resolved_tasks([tasks])
-    elif isinstance(tasks, list) and isinstance(tasks[0], Task):
-        return as_resolved_tasks(cast(list[Task], tasks))
-
-    # simple case of passing us PreviousTask
+    # reflect resolved tasks right back
+    if isinstance(tasks, ResolvedTask):
+        return [tasks]
     if isinstance(tasks, PreviousTask):
         tasks = [tasks]
-    if isinstance(tasks, list) and isinstance(tasks[0], PreviousTask):
-        # for previous tasks, prefer recreating from the registry (so we have
-        # a fresh instance) but also allow recycling of task instances for
-        # fully dynamic tasks
-        previous_tasks = cast(list[PreviousTask], tasks)
-        loaded_tasks: list[Task] = []
-        loaded_tasks_args: list[dict[str, Any]] = []
-        for previous_task in previous_tasks:
-            if isinstance(previous_task.task, Task):
-                loaded_task_args = previous_task.task_args
-                loaded_task = previous_task.task
-            else:
-                loaded_task_args = previous_task.task_args
-                loaded_task = load_tasks([previous_task.task], loaded_task_args)[0]
-            if sample_shuffle is not None:
-                if not loaded_task.dataset.shuffled:
-                    loaded_task.dataset.shuffle(
-                        None if sample_shuffle is True else sample_shuffle
-                    )
-            loaded_tasks.append(loaded_task)
-            loaded_tasks_args.append(loaded_task_args)
+    if isinstance(tasks, list) and isinstance(tasks[0], (ResolvedTask, PreviousTask)):
+        return resolve_previous_tasks(
+            [t for t in tasks if isinstance(t, (ResolvedTask, PreviousTask))],
+            sample_shuffle=sample_shuffle,
+            model=model,
+            model_roles=model_roles,
+            eval_checkpoint=eval_checkpoint,
+        )
 
-        return [
-            ResolvedTask(
-                task=loaded_task,
-                task_args=loaded_task_args,
-                task_file=previous_task.log.eval.task_file,
-                model=previous_task.model or loaded_task.model or model,
-                model_roles=(
-                    previous_task.model_roles or loaded_task.model_roles or model_roles
-                ),
-                sandbox=previous_task.log.eval.sandbox,
-                sequence=sequence,
-                id=previous_task.id,
-                sample_source=eval_log_sample_source(
-                    previous_task.log, loaded_task.dataset
-                ),
+    # simple cases of passing us Task objects -- task_args are never applied
+    # to Task instances (their args come from the instance's own construction
+    # params), so warn if the caller passed args that will be silently ignored
+    if isinstance(tasks, Task) or (
+        isinstance(tasks, list) and isinstance(tasks[0], Task)
+    ):
+        if warn_unconsumed_task_args and task_args:
+            logger.warning(
+                f"task_args {sorted(task_args.keys())} will not be applied: "
+                "they are ignored for Task instances passed directly. Pass "
+                "them to your @task function when creating the task instead."
             )
-            for sequence, loaded_task, loaded_task_args, previous_task in zip(
-                range(0, len(loaded_tasks)),
-                loaded_tasks,
-                loaded_tasks_args,
-                previous_tasks,
-            )
-        ]
+        task_list = (
+            [tasks]
+            if isinstance(tasks, Task)
+            else [t for t in tasks if isinstance(t, Task)]
+        )
+        return as_resolved_tasks(task_list)
 
     # convert TaskInfo to str
     if isinstance(tasks, TaskInfo):
         tasks = [tasks]
     if isinstance(tasks, list) and isinstance(tasks[0], TaskInfo):
-        tasks = [f"{task.file}@{task.name}" for task in cast(list[TaskInfo], tasks)]
+        tasks = [
+            f"{task.file}@{task.name}" for task in tasks if isinstance(task, TaskInfo)
+        ]
 
     # handle functions that return tasks (we get their registry name)
     if isinstance(tasks, list) and callable(tasks[0]):
@@ -158,6 +178,196 @@ def resolve_tasks(
 
     # done! let's load the tasks
     return as_resolved_tasks(load_tasks(cast(list[str] | None, tasks), task_args))
+
+
+def refers_to_task_source(tasks: Tasks) -> bool:
+    """Whether `tasks` is, or refers to, a `TaskSource` — without creating it.
+
+    Mirrors :func:`resolve_task_source`'s detection (instance, `@task_source`
+    function, registered name, or `file.py@name` spec) but stops short of
+    instantiating the source. Used to reject a `TaskSource` where it isn't
+    supported (eval_set / eval_retry / score) without paying its (potentially
+    expensive) construction just to raise an error.
+    """
+    if isinstance(tasks, list):
+        if len(tasks) != 1:
+            return False
+        tasks = tasks[0]
+    if isinstance(tasks, TaskSource):
+        return True
+    if callable(tasks):
+        return is_registry_object(tasks) and registry_info(tasks).type == "task_source"
+    if isinstance(tasks, str):
+        if registry_lookup("task_source", tasks) is not None:
+            return True
+        file, name = split_spec(tasks)
+        if name is not None:
+            task_path = Path(file)
+            if task_path.suffix == ".py" and task_path.exists():
+                try:
+                    has_source = code_has_decorator(
+                        task_path.read_text(encoding="utf-8"), "task_source"
+                    )
+                except OSError:
+                    return False
+                if has_source:
+                    # load the module so its `@task_source` registers, then
+                    # confirm `name` is the source (not a `@task` in the same file)
+                    load_file_tasks(task_path.absolute())
+                    return registry_lookup("task_source", name) is not None
+    return False
+
+
+def resolve_task_source(tasks: Tasks, task_args: dict[str, Any]) -> TaskSource | None:
+    """Resolve `tasks` to a `TaskSource` if it is (or names) one, else `None`.
+
+    Handles the forms `eval()` accepts for a source: a `TaskSource` instance, a
+    `@task_source`-decorated function, a registered source name, or a
+    `file.py@name` spec naming a `@task_source`. Anything else returns `None` so
+    normal task resolution proceeds. The single-element list form is accepted
+    because the CLI passes specs as a list.
+    """
+    if isinstance(tasks, list):
+        if len(tasks) != 1:
+            return None
+        tasks = tasks[0]
+
+    # already a TaskSource instance
+    if isinstance(tasks, TaskSource):
+        return tasks
+
+    # a @task_source-decorated function (registered under type "task_source")
+    if callable(tasks):
+        if is_registry_object(tasks) and registry_info(tasks).type == "task_source":
+            return task_source_create(registry_info(tasks).name, **task_args)
+        return None
+
+    # a registered source name, or a file.py@name spec naming a source
+    if isinstance(tasks, str):
+        if registry_lookup("task_source", tasks) is not None:
+            return task_source_create(tasks, **task_args)
+        file, name = split_spec(tasks)
+        if name is not None:
+            return _load_task_source_from_file(file, name, task_args)
+
+    return None
+
+
+def _load_task_source_from_file(
+    file: str, name: str, task_args: dict[str, Any]
+) -> TaskSource | None:
+    # only probe local .py files that actually define a @task_source (a cheap
+    # text check so a task-only file isn't loaded here and then again as tasks)
+    task_path = Path(file)
+    if task_path.suffix != ".py" or not task_path.exists():
+        return None
+    try:
+        if not code_has_decorator(task_path.read_text(encoding="utf-8"), "task_source"):
+            return None
+    except OSError:
+        return None
+
+    # load the file's module (registers its decorators), then create the source
+    # — mirrors create_tasks' load_file_tasks + create_file_tasks for tasks
+    load_file_tasks(task_path.absolute())
+    if registry_lookup("task_source", name) is None:
+        return None
+    source = task_source_create(name, **task_args)
+    setattr(source, TASK_FILE_ATTR, task_path.as_posix())
+    setattr(source, TASK_RUN_DIR_ATTR, task_path.parent.resolve().as_posix())
+    return source
+
+
+def resolve_previous_tasks(
+    tasks: list[ResolvedTask] | list[PreviousTask] | list[ResolvedTask | PreviousTask],
+    sample_shuffle: bool | int | None,
+    model: Model,
+    model_roles: dict[str, Model] | None,
+    eval_checkpoint: CheckpointConfig | None = None,
+) -> list[ResolvedTask]:
+    result = []
+    for sequence, task in enumerate(tasks):
+        if isinstance(task, ResolvedTask):
+            sequenced_task = replace(task, sequence=sequence)
+            result.append(sequenced_task)
+        else:
+            # for previous tasks, prefer recreating from the registry (so we have
+            # a fresh instance) but also allow recycling of task instances for
+            # fully dynamic tasks
+            previous_task = task
+            if isinstance(previous_task.task, Task):
+                loaded_task_args = previous_task.task_args
+                loaded_task = previous_task.task
+            else:
+                loaded_task_args = previous_task.task_args
+                loaded_task = load_tasks([previous_task.task], loaded_task_args)[0]
+            if sample_shuffle is not None:
+                if not loaded_task.dataset.shuffled:
+                    loaded_task.dataset.shuffle(
+                        None if sample_shuffle is True else sample_shuffle
+                    )
+            result.append(
+                resolve_previous_task(
+                    loaded_task,
+                    loaded_task_args,
+                    model,
+                    model_roles,
+                    previous_task,
+                    sequence,
+                    eval_checkpoint,
+                )
+            )
+    return result
+
+
+def resolve_previous_task(
+    loaded_task: Task,
+    loaded_task_args: dict[str, Any],
+    model: Model,
+    model_roles: dict[str, Model] | None,
+    previous_task: PreviousTask,
+    sequence: int,
+    eval_checkpoint: CheckpointConfig | None = None,
+) -> ResolvedTask:
+    # carry token usage forward from the prior log so cumulative totals stay
+    # accurate across retries. Deep-copy so the prior log is never mutated.
+    prior_stats = previous_task.log.stats
+    initial_model_usage = (
+        copy.deepcopy(prior_stats.model_usage) if prior_stats.model_usage else None
+    )
+    initial_role_usage = (
+        copy.deepcopy(prior_stats.role_usage) if prior_stats.role_usage else None
+    )
+
+    return ResolvedTask(
+        task=loaded_task,
+        task_args=loaded_task_args,
+        task_file=previous_task.log.eval.task_file,
+        model=previous_task.model or loaded_task.model or model,
+        model_roles=_merge_model_roles(
+            model_roles, loaded_task.model_roles, previous_task.model_roles
+        ),
+        sandbox=resolve_task_file_sandbox(
+            previous_task.log.eval.task_file, previous_task.log.eval.sandbox
+        ),
+        checkpoint=loaded_task.checkpoint,
+        sequence=sequence,
+        id=previous_task.id,
+        sample_source=eval_log_sample_source(
+            previous_task.log,
+            previous_task.log_info,
+            loaded_task.dataset,
+            eval_checkpoints_dir_from_config(
+                previous_task.log_info.name
+                if previous_task.log_info is not None
+                else previous_task.log.location,
+                loaded_task.checkpoint,
+                eval_checkpoint,
+            ),
+        ),
+        initial_model_usage=initial_model_usage,
+        initial_role_usage=initial_role_usage,
+    )
 
 
 def resolve_task_args(task: Task) -> dict[str, Any]:
@@ -202,6 +412,27 @@ def resolve_task_sandbox(
                     )
                     break
 
+            # if we found an override without a config then we may still
+            # want to forward the task config if it's docker config ->
+            # docker compatible sandbox
+            if resolved_sandbox.config is None and task.sandbox is not None:
+                if is_docker_compatible_config(
+                    task.sandbox.config
+                ) and is_docker_compatible_sandbox_type(resolved_sandbox.type):
+                    resolved_sandbox = SandboxEnvironmentSpec(
+                        resolved_sandbox.type, task.sandbox.config
+                    )
+                elif is_docker_compatible_config(task.sandbox.config):
+                    warn_once(
+                        logger,
+                        f"Task '{task.name}' declares sandbox '{task.sandbox.type}' "
+                        "with a Dockerfile/compose.yaml configuration, but the "
+                        f"'{resolved_sandbox.type}' sandbox specified for the eval "
+                        "does not support that configuration. The task's compose "
+                        "services, packages, and tools will not be available in "
+                        f"the '{resolved_sandbox.type}' sandbox.",
+                    )
+
         # resolve relative paths
         if isinstance(resolved_sandbox.config, str):
             file_path = Path(resolved_sandbox.config)
@@ -213,6 +444,25 @@ def resolve_task_sandbox(
 
     # return resolved sandbox
     return resolved_sandbox
+
+
+def resolve_task_file_sandbox(
+    task_file: str | None, sandbox: SandboxEnvironmentSpec | None
+) -> SandboxEnvironmentSpec | None:
+    if sandbox is None or not isinstance(sandbox.config, str):
+        return sandbox
+
+    if task_file is None:
+        return sandbox
+
+    file_path = Path(sandbox.config)
+    if file_path.is_absolute():
+        return sandbox
+
+    # resolve relative sandbox config paths from logged task file location
+    src_dir = Path(task_file).parent
+    file_path = (src_dir / file_path).resolve()
+    return SandboxEnvironmentSpec(sandbox.type, file_path.as_posix())
 
 
 def load_tasks(
@@ -232,6 +482,9 @@ def load_task_spec(task_spec: str, task_args: dict[str, Any] = {}) -> list[Task]
     if registry_lookup("task", task_spec) is not None:
         # create the task from a python package
         return [task_create(task_spec, **task_args)]
+    elif task_spec.startswith("hf/"):
+        # load task from huggingface
+        return task_create_from_hf(task_spec, **task_args)
     else:
         # load tasks from glob
         return create_tasks([task_spec], task_args)
@@ -314,22 +567,15 @@ def create_file_tasks(
 # change the working directory, this one does not b/c it is
 # intended as a helper function)
 def _load_task_specs(task_path: Path) -> list[str]:
-    # load the module
-    module = load_module(task_path, code_has_task)
+    # load the module (also load files that only define task sources, so a
+    # `@task_source` is registered/discoverable just like a `@task`)
+    module = load_module(task_path, code_has_task_or_source)
     if module:
         # find the tasks in the module
         tasks = parse_decorators(task_path, "task")
         return [task[0] for task in tasks]
     else:
         return []
-
-
-def split_spec(spec: str) -> tuple[str, str | None]:
-    parts = spec.rsplit("@", 1)
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    else:
-        return spec, None
 
 
 def code_has_decorator(code: str, decorator: str) -> bool:
@@ -357,12 +603,20 @@ def code_has_task(code: str) -> bool:
     return code_has_decorator(code, "task")
 
 
+def code_has_task_or_source(code: str) -> bool:
+    return code_has_decorator(code, "task") or code_has_decorator(code, "task_source")
+
+
 def as_solver_spec(solver: Solver) -> SolverSpec:
     if not is_registry_object(solver):
         raise PrerequisiteError(
             f"The solver {getattr(solver, '__name__', '<unknown>')} was not created by a function decorated with @solver so cannot be recorded."
         )
-    return SolverSpec(solver=registry_info(solver).name, args=registry_params(solver))
+    return SolverSpec(
+        solver=registry_info(solver).name,
+        args=getattr(solver, SOLVER_ALL_PARAMS_ATTR, {}),
+        args_passed=registry_params(solver),
+    )
 
 
 def solver_from_spec(spec: SolverSpec) -> Solver:
@@ -387,9 +641,21 @@ def solver_from_spec(spec: SolverSpec) -> Solver:
             if solver_name is None:
                 raise ValueError(f"Unable to resolve solver name from {spec.solver}")
             elif registry_lookup("solver", solver_name) is not None:
-                return registry_create("solver", solver_name, **spec.args)
+                # create via create_registry_object (args as a dict) so a solver
+                # factory with its own `name` parameter doesn't collide with
+                # registry_create's positional `name` argument on replay.
+                return cast(
+                    Solver,
+                    create_registry_object("solver", solver_name, spec.args_passed),
+                )
             elif registry_lookup("agent", solver_name) is not None:
-                agent = registry_create("agent", solver_name, **spec.args)
+                # create via create_registry_object (args as a dict) so an agent
+                # factory with its own `name` parameter doesn't collide with
+                # registry_create's positional `name` argument.
+                agent = cast(
+                    Agent,
+                    create_registry_object("agent", solver_name, spec.args_passed),
+                )
                 return as_solver(agent)
             else:
                 raise ValueError(
@@ -448,18 +714,27 @@ def solver_from_spec(spec: SolverSpec) -> Solver:
 
             # create decorator based solvers using the registry
             if any(solver[0] == solver_name for solver in solver_decorators):
-                return registry_create("solver", solver_name, **spec.args)
+                # create via create_registry_object (args as a dict) so a solver
+                # factory with its own `name` parameter doesn't collide with
+                # registry_create's positional `name` argument on replay.
+                return cast(
+                    Solver,
+                    create_registry_object("solver", solver_name, spec.args_passed),
+                )
 
             # create decorator based agents using the registry
             elif any(agent[0] == solver_name for agent in agent_decorators):
-                agent = registry_create("agent", solver_name, **spec.args)
+                agent = cast(
+                    Agent,
+                    create_registry_object("agent", solver_name, spec.args_passed),
+                )
                 return as_solver(agent)
 
             # create bridge based solvers by calling the function and wrapping it in bridge()
             else:
                 agent_fn = getattr(solver_module, solver_name, None)
                 if inspect.isfunction(agent_fn):
-                    return bridge(agent_fn(**spec.args))
+                    return bridge(agent_fn(**spec.args_passed))
                 elif agent_fn is not None:
                     raise PrerequisiteError(
                         f"The object {solver_name} in file {pretty_solver_file} is not a Python function."
@@ -503,11 +778,25 @@ def scorer_from_spec(spec: ScorerSpec, task_path: Path | None, **kwargs: Any) ->
     # See if the scorer doesn't have type annotations. Currently the registry will not load
     # the function without type annotations.
     # TODO: We could consider calling this ourselves if we're certain it is what we're looking for
-    def validate_scorer(scorer_fn: Scorer, task_name: str, task_path: str) -> None:
+    def validate_scorer(scorer_fn: Scorer, scorer_name: str, scorer_path: str) -> None:
         signature = inspect.signature(scorer_fn)
         if signature.return_annotation is inspect.Signature.empty:
             raise PrerequisiteError(
-                f"The scorer '{task_name}' in the file '{task_path}' requires a 'Scorer' return type annotation. Please add the 'Scorer' type annotation to load the scorer."
+                f"The function '{scorer_name}' in the file '{scorer_path}' requires a return type annotation. Please add a return type annotation to use this function with scoring."
+            )
+
+    def create_scorer(scorer_name: str, **kwargs: Any) -> Scorer:
+        # handle scorers and scanners
+        if registry_lookup("scorer", scorer_name) is not None:
+            return scorer_create(scorer_name, **kwargs)
+        elif registry_lookup("scanner", scorer_name) is not None:
+            from inspect_scout import Scanner, Transcript, as_scorer
+
+            scanner = create_registry_object("scanner", scorer_name, kwargs)
+            return as_scorer(cast(Scanner[Transcript], scanner))
+        else:
+            raise ValueError(
+                f"Unknown scorer {scorer_name} (not registered as a @scorrer or @scanner)"
             )
 
     with create_cm:
@@ -534,7 +823,7 @@ def scorer_from_spec(spec: ScorerSpec, task_path: Path | None, **kwargs: Any) ->
                 # We have the path to a file, so load that and try again
                 try:
                     load_module(task_path)
-                    scorer_fn = scorer_create(scorer_name, **kwargs)
+                    scorer_fn = create_scorer(scorer_name, **kwargs)
                     validate_scorer(scorer_fn, scorer_name, task_pretty_path)
                     return scorer_fn
                 except ValueError:
@@ -551,30 +840,99 @@ def scorer_from_spec(spec: ScorerSpec, task_path: Path | None, **kwargs: Any) ->
         # solver is a path, so load it that way
         else:
             load_module(scorer_file)
-            decorators = parse_decorators(scorer_file, "scorer")
+            scorer_decorators = parse_decorators(scorer_file, "scorer")
+            scanner_decorators = parse_decorators(scorer_file, "scanner")
 
-            # if there is no solver_name see if we can discover it
+            # if there is no scorer_name see if we can discover it
             if scorer_name is None:
-                if len(decorators) == 1:
-                    # decorator based solver
-                    scorer_name = decorators[0][0]
-                elif len(decorators) == 0:
+                if len(scorer_decorators) == 1:
+                    scorer_name = scorer_decorators[0][0]
+                elif len(scanner_decorators) == 1:
+                    scorer_name = scanner_decorators[0][0]
+                elif len(scorer_decorators) == 0 and len(scanner_decorators) == 0:
                     raise PrerequisiteError(
-                        f"The source file {pretty_scorer_file} does not contain any @scorer functions."
+                        f"The source file {pretty_scorer_file} does not contain any @scorer or @scanner functions."
                     )
                 else:
                     raise PrerequisiteError(
-                        f"The source file {pretty_scorer_file} has more than one @solver function (qualify which solver using e.g. '{scorer_file.name}y@solver_fn')"
+                        f"The source file {pretty_scorer_file} has more than one @scorer or @scanner function (qualify which scorer using e.g. '{scorer_file.name}y@scorer_fn')"
                     )
 
             # create decorator based solvers using the registry
-            if any(solver[0] == scorer_name for solver in decorators):
-                scorer_fn = scorer_create(scorer_name, **kwargs)
+            if any(
+                solver[0] == scorer_name
+                for solver in (scorer_decorators + scanner_decorators)
+            ):
+                scorer_fn = create_scorer(scorer_name, **kwargs)
                 validate_scorer(scorer_fn, scorer_name, pretty_scorer_file or "")
                 return scorer_fn
             else:
                 raise PrerequisiteError(
                     f"The function {scorer_name} was not found in file {pretty_scorer_file}."
+                )
+
+
+def metric_from_spec(spec: MetricSpec, **kwargs: Any) -> Metric:
+    """
+    Load a metric
+
+    Args:
+        spec: The metric spec
+        **kwargs: Additional keyword arguments passed to the metric initialization
+
+    Returns:
+        Metric: the loaded metric
+
+    Raises:
+        PrerequisiteError: If the metric cannot be found or loaded
+    """
+    # resolve @ reference
+    metric_file, metric_name = parse_spec_str(spec.metric)
+
+    # switch contexts if we are loading from a file
+    create_cm = (
+        chdir_python(metric_file.parent.as_posix())
+        if metric_file is not None
+        else contextlib.nullcontext()
+    )
+
+    # pretty metric name for error messages
+    pretty_metric_file = (
+        cwd_relative_path(metric_file.as_posix()) if metric_file else None
+    )
+
+    with create_cm:
+        # is there a metric file being provided? if not, load from registry
+        if metric_file is None:
+            if metric_name is None:
+                raise ValueError(f"Unable to resolve metric name from {spec.metric}")
+
+            return metric_create(metric_name, **kwargs)
+
+        # metric is a path, so load it that way
+        else:
+            load_module(metric_file)
+            metric_decorators = parse_decorators(metric_file, "metric")
+
+            # if there is no metric_name see if we can discover it
+            if metric_name is None:
+                if len(metric_decorators) == 1:
+                    metric_name = metric_decorators[0][0]
+                elif len(metric_decorators) == 0:
+                    raise PrerequisiteError(
+                        f"The source file {pretty_metric_file} does not contain any @metric functions."
+                    )
+                else:
+                    raise PrerequisiteError(
+                        f"The source file {pretty_metric_file} has more than one @metric function (qualify which metric using e.g. '{metric_file.name}@metric_fn')"
+                    )
+
+            # create decorator based metrics using the registry
+            if any(metric[0] == metric_name for metric in metric_decorators):
+                return metric_create(metric_name, **kwargs)
+            else:
+                raise PrerequisiteError(
+                    f"The function {metric_name} was not found in file {pretty_metric_file}."
                 )
 
 

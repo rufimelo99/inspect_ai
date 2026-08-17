@@ -13,6 +13,7 @@ from .extract import (
     sample_input_as_str,
     sample_messages_as_str,
     sample_path_requires_full,
+    sample_total_fallbacks,
     sample_total_tokens,
 )
 
@@ -32,7 +33,7 @@ class SampleColumn(Column):
         default: JsonValue | None = None,
         type: Type[ColumnType] | None = None,
         value: Callable[[JsonValue], JsonValue] | None = None,
-        full: bool = False,
+        full: bool | None = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -43,7 +44,10 @@ class SampleColumn(Column):
             value=value,
         )
         self._extract_sample = path if callable(path) else None
-        self._full = full or sample_path_requires_full(path)
+        if full is None:
+            self._full = sample_path_requires_full(path)
+        else:
+            self._full = full
 
     @override
     def path_schema(self) -> Mapping[str, Any]:
@@ -60,17 +64,21 @@ SampleSummary: list[Column] = [
     SampleColumn("id", path="id", required=True, type=str),
     SampleColumn("epoch", path="epoch", required=True),
     SampleColumn("input", path=sample_input_as_str, required=True),
+    SampleColumn("choices", path="choices", full=False),
     SampleColumn("target", path="target", required=True, value=list_as_str),
     SampleColumn("metadata_*", path="metadata"),
     SampleColumn("score_*", path="scores", value=score_values),
     SampleColumn("model_usage", path="model_usage"),
     SampleColumn("total_tokens", path=sample_total_tokens),
     SampleColumn("total_time", path="total_time"),
-    SampleColumn("working_time", path="total_time"),
+    SampleColumn("working_time", path="working_time"),
     SampleColumn("message_count", path="message_count", default=None),
+    SampleColumn("turn_count", path="turn_count", default=None),
+    SampleColumn("token_limit_usage", path="token_limit_usage", default=None),
     SampleColumn("error", path="error", default=""),
     SampleColumn("limit", path="limit"),
     SampleColumn("retries", path="retries"),
+    SampleColumn("fallbacks", path=sample_total_fallbacks),
 ]
 """Sample summary columns."""
 

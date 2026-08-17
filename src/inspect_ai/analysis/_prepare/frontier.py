@@ -1,3 +1,5 @@
+from typing import Hashable
+
 from inspect_ai.analysis._prepare.operation import Operation
 
 
@@ -40,9 +42,15 @@ def frontier(
             # Filter out models with missing release dates for frontier calculation
             task_group_with_dates = task_group.dropna(subset=[date_column])
 
-            # For each release date, keep only the highest scoring model
-            best_per_date = task_group_with_dates.dropna(subset=[score_column]).loc[
-                task_group_with_dates.groupby(date_column)[score_column].idxmax()
+            # For each release date, keep only the highest scoring model.
+            # Drop rows with a missing score *before* grouping so that a
+            # release-date group whose scores are all missing is skipped
+            # rather than crashing: groupby(...).idxmax() raises (pandas >= 3)
+            # or yields NaN (pandas < 3, breaking the subsequent .loc) when a
+            # group contains only NA values.
+            scored_with_dates = task_group_with_dates.dropna(subset=[score_column])
+            best_per_date = scored_with_dates.loc[
+                scored_with_dates.groupby(date_column)[score_column].idxmax()
             ]
 
             # Sort by model_release_date to process chronologically
@@ -50,7 +58,7 @@ def frontier(
 
             # Track the highest score seen so far
             highest_score = float("-inf")
-            frontier_indices = []
+            frontier_indices: list[Hashable] = []
 
             for idx, row in best_per_date.iterrows():
                 current_score = row[score_column]
@@ -61,7 +69,8 @@ def frontier(
                     frontier_indices.append(idx)
 
             # Mark frontier models
-            df.loc[frontier_indices, frontier_column] = True
+            if frontier_indices:
+                df.loc[pd.Index(frontier_indices), frontier_column] = True
 
         return df
 

@@ -15,11 +15,14 @@ from typing import (
 
 from inspect_ai._util.registry import (
     RegistryInfo,
+    extract_named_params,
     is_registry_object,
     registry_add,
     registry_info,
     registry_name,
     registry_tag,
+    registry_unqualified_name,
+    set_annotations,
     set_registry_info,
 )
 from inspect_ai.model._chat_message import (
@@ -158,6 +161,8 @@ def agent(
     """
 
     def create_agent_wrapper(agent_type: Callable[P, Agent]) -> Callable[P, Agent]:
+        from inspect_ai.solver._constants import SOLVER_ALL_PARAMS_ATTR
+
         # determine the name (explicit or implicit from object)
         agent_name = registry_name(
             agent_type, name if name else getattr(agent_type, "__name__")
@@ -169,27 +174,42 @@ def agent(
             # create agent
             agent = agent_type(*args, **kwargs)
 
-            # this might already have registry info, if so capture that
-            # and use it as default
+            # capture any display name and description the agent may carry
+            # (e.g. set via agent_with() inside the factory body)
             if is_registry_object(agent):
                 info = registry_info(agent)
-                registry_name = info.name
+                inner_display = info.metadata.get(AGENT_NAME, None)
                 registry_description = info.metadata.get(AGENT_DESCRIPTION, None)
             else:
-                registry_name = None
+                inner_display = None
                 registry_description = None
+
+            # RegistryInfo.name is always the registry lookup name. The decorator
+            # `name` (if any) is already folded into `agent_name` (which is also
+            # the registry key), so it overrides the registry name as before.
+            #
+            # The display name (decorator `name`, else any inner agent_with name)
+            # is kept separately in metadata and used for transcript spans, handoff
+            # prose, and handoff()/as_tool() tool names.
+            display_name = name or inner_display
 
             registry_tag(
                 agent_type,
                 agent,
                 RegistryInfo(
                     type="agent",
-                    name=registry_name or agent_name,
-                    metadata={AGENT_DESCRIPTION: registry_description or description},
+                    name=agent_name,
+                    metadata=_agent_metadata(
+                        display_name, description or registry_description
+                    ),
                 ),
                 *args,
                 **kwargs,
             )
+
+            named_params = extract_named_params(agent_type, True, *args, **kwargs)
+            setattr(agent, SOLVER_ALL_PARAMS_ATTR, named_params)
+
             return agent
 
         # If a user's code runs "from __future__ import annotations", all type annotations are stored as strings,
@@ -197,8 +217,9 @@ def agent(
         # The following two lines resolve these string annotations using the original function's globals,
         # ensuring that any forward references (e.g., "Agent") are evaluated to their actual types,
         # and then reassign the original function's signature to the wrapper.
-        agent_wrapper.__annotations__ = get_type_hints(
-            agent_wrapper, agent_type.__globals__
+        set_annotations(
+            agent_wrapper,
+            {**get_type_hints(agent_wrapper, agent_type.__globals__), "return": Agent},
         )
         agent_wrapper.__signature__ = signature(agent_type)  # type: ignore[attr-defined]
 
@@ -232,21 +253,22 @@ def agent_with(
     Returns:
        The passed agent with the requested modifications.
     """
-    # resolve name and description
+    # resolve name and description. note that `name` is a *display* name and is
+    # intentionally NOT written to RegistryInfo.name: agent_with() must never
+    # override the registry identity (the result is not a directly-callable
+    # registered factory). The registry name is preserved as-is.
+    identity = "agent"
     if is_registry_object(agent):
         info = registry_info(agent)
-        name = name or info.name
+        identity = info.name
+        name = name or info.metadata.get(AGENT_NAME, None)
         description = description or info.metadata.get(AGENT_DESCRIPTION, None)
 
-    # now set registry info
+    # now set registry info (preserving the registry identity)
     set_registry_info(
         agent,
         RegistryInfo(
-            type="agent",
-            name=name or "agent",
-            metadata={AGENT_DESCRIPTION: description}
-            if description is not None
-            else {},
+            type="agent", name=identity, metadata=_agent_metadata(name, description)
         ),
     )
 
@@ -287,3 +309,39 @@ def is_agent(obj: Any) -> TypeGuard[Agent]:
 
 
 AGENT_DESCRIPTION = "description"
+
+AGENT_NAME = "name"
+"""Registry metadata key holding an agent's display name.
+
+`RegistryInfo.name` is always the registry lookup name (the replayable identity).
+A display name set via `agent_with(name=...)` is recorded here instead of in
+`RegistryInfo.name`, and is used for transcript spans, handoff prose, and
+(sanitized) `handoff()` / `as_tool()` tool names.
+"""
+
+
+def _agent_metadata(name: str | None, description: str | None) -> dict[str, Any]:
+    """Build agent RegistryInfo metadata from an optional name and description."""
+    metadata: dict[str, Any] = {}
+    if name is not None:
+        metadata[AGENT_NAME] = name
+    if description is not None:
+        metadata[AGENT_DESCRIPTION] = description
+    return metadata
+
+
+def agent_display_name(agent: Agent) -> str:
+    """Human/model-facing display name for an agent.
+
+    Returns the agent's display name (set via `agent_with(name=...)` or an
+    `@agent` factory's `name` parameter) when present, otherwise the unqualified
+    registry name.
+
+    Args:
+        agent: Agent to get the display name for.
+
+    Returns:
+        Display name for the agent.
+    """
+    display = registry_info(agent).metadata.get(AGENT_NAME, None)
+    return display if display else registry_unqualified_name(agent)

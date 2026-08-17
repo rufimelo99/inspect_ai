@@ -1,10 +1,13 @@
 import time
+from datetime import datetime, timezone
 from typing import Any, TypeAlias
 
 import pydantic
 from google.genai import Client
 from google.genai.types import (
+    Content,
     CreateBatchJobConfig,
+    GenerateContentConfig,
     GenerateContentResponse,
     HttpOptions,
     JobError,
@@ -16,12 +19,57 @@ from typing_extensions import override
 from inspect_ai.model._generate_config import BatchConfig
 from inspect_ai.model._retry import ModelRetryConfig
 
-from .util.batch import Batch, BatchRequest
+from .util.batch import Batch, BatchCheckResult, BatchRequest
 from .util.file_batcher import FileBatcher
 from .util.hooks import HttpxHooks
 
 # Just the result URI
 CompletedBatchInfo: TypeAlias = str
+
+# Fields that belong at the top level of GenerateContentRequest (not under generationConfig).
+# Everything else from GenerateContentConfig is nested under generationConfig in the
+# REST schema.
+_REQUEST_TOP_LEVEL_FIELDS = {
+    "safety_settings",
+    "tools",
+    "tool_config",
+    "system_instruction",
+    "cached_content",
+}
+
+# SDK-only fields that don't appear in the REST schema at all.
+_SDK_ONLY_FIELDS = {
+    "http_options",
+    "automatic_function_calling",
+    "should_return_http_response",
+    "labels",
+}
+
+
+def batch_request_dict(
+    config: GenerateContentConfig, contents: list[Content]
+) -> dict[str, Any]:
+    """Build a dict matching the REST GenerateContentRequest schema.
+
+    The SDK's GenerateContentConfig flattens everything, but the batch JSONL
+    format expects the REST shape where generation params (temperature, thinking_config,
+    etc.) are nested under "generation_config".
+    """
+    # Route each field to its correct location in the REST schema. Unlisted fields
+    # (thinking_config, temperature, etc.) go into generation_config
+    # see _REQUEST_TOP_LEVEL_FIELDS.
+    params = config.model_dump(exclude_none=True)
+    top_level = {k: v for k, v in params.items() if k in _REQUEST_TOP_LEVEL_FIELDS}
+    generation_config = {
+        k: v
+        for k, v in params.items()
+        if k not in _REQUEST_TOP_LEVEL_FIELDS and k not in _SDK_ONLY_FIELDS
+    }
+    return {
+        "contents": [c.model_dump(exclude_none=True) for c in contents],
+        **top_level,
+        **({"generation_config": generation_config} if generation_config else {}),
+    }
 
 
 class GoogleBatcher(FileBatcher[GenerateContentResponse, CompletedBatchInfo]):
@@ -49,13 +97,7 @@ class GoogleBatcher(FileBatcher[GenerateContentResponse, CompletedBatchInfo]):
     ) -> dict[str, pydantic.JsonValue]:
         return {
             "key": custom_id,
-            "request": {
-                **{
-                    k: v
-                    for k, v in request.request.items()
-                    if k not in ("http_options")
-                }
-            },
+            "request": dict(request.request),
         }
 
     @override
@@ -123,14 +165,15 @@ class GoogleBatcher(FileBatcher[GenerateContentResponse, CompletedBatchInfo]):
     @override
     async def _check_batch(
         self, batch: Batch[GenerateContentResponse]
-    ) -> tuple[int, int, int, CompletedBatchInfo | None]:
+    ) -> BatchCheckResult[CompletedBatchInfo]:
         batch_job = await self._client.aio.batches.get(name=batch.id)
 
-        # Calculate age
-        age = (
-            int((time.time() - batch_job.create_time.timestamp()))
-            if batch_job.create_time
-            else 0
+        created_at = int(
+            (
+                batch_job.create_time
+                if batch_job.create_time
+                else datetime.now(tz=timezone.utc)
+            ).timestamp()
         )
 
         # Handle different job states
@@ -138,21 +181,39 @@ class GoogleBatcher(FileBatcher[GenerateContentResponse, CompletedBatchInfo]):
             batch_job.state == JobState.JOB_STATE_PENDING
             or batch_job.state == JobState.JOB_STATE_RUNNING
         ):
-            return (0, 0, age, None)
-        elif batch_job.state == JobState.JOB_STATE_SUCCEEDED:
-            assert batch_job.dest and batch_job.dest.file_name, "must find batch dest"
-            return (
-                len(batch.requests),  # Assume all completed if job succeeded
-                0,  # Failed count will be determined during result parsing
-                age,
-                batch_job.dest.file_name,
+            return BatchCheckResult(
+                completed_count=0,
+                failed_count=0,
+                created_at=created_at,
+                completion_info=None,
             )
-        elif batch_job.state in [
+        elif batch_job.state in (
+            JobState.JOB_STATE_SUCCEEDED,
+            JobState.JOB_STATE_PARTIALLY_SUCCEEDED,
+        ):
+            assert batch_job.dest and batch_job.dest.file_name, "must find batch dest"
+            return BatchCheckResult(
+                completed_count=len(batch.requests),
+                failed_count=0,  # Failed count will be determined during result parsing
+                created_at=created_at,
+                completion_info=batch_job.dest.file_name,
+            )
+        elif batch_job.state in (
             JobState.JOB_STATE_FAILED,
             JobState.JOB_STATE_CANCELLED,
-        ]:
-            # Job failed or was cancelled - all requests failed
-            return (0, len(batch.requests), age, None)
+            JobState.JOB_STATE_EXPIRED,
+        ):
+            return BatchCheckResult(
+                completed_count=0,
+                failed_count=len(batch.requests),
+                created_at=created_at,
+                completion_info=None,
+            )
         else:
             # Unknown state - treat as pending
-            return (0, 0, age, None)
+            return BatchCheckResult(
+                completed_count=0,
+                failed_count=0,
+                created_at=created_at,
+                completion_info=None,
+            )

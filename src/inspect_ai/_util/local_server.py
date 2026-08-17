@@ -14,10 +14,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # Global dictionary to keep track of process -> reserved port mappings
-process_socket_map = {}
+process_socket_map: dict[subprocess.Popen[str], socket.socket] = {}
 
+DEFAULT_RETRY_DELAY = 5
 
 DEFAULT_TIMEOUT = 60 * 10  # fairly conservative default timeout of 10 minutes
+
+
+def _server_arg_to_cli_key(key: str) -> str:
+    """Convert a Python-style server arg key to a CLI flag key."""
+    if "." not in key:
+        return key.replace("_", "-")
+
+    top_level, *nested = key.split(".")
+    return ".".join([top_level.replace("_", "-"), *nested])
 
 
 def reserve_port(
@@ -308,10 +318,14 @@ def start_local_server(
     if server_args:
         for key, value in server_args.items():
             # Convert Python style args (underscore) to CLI style (dash)
-            cli_key = key.replace("_", "-")
-            if value is None:
-                # If the value is empty, just add the flag
-                full_command.extend([f"--{cli_key}"])
+            cli_key = _server_arg_to_cli_key(key)
+            if isinstance(value, bool):
+                if value:
+                    full_command.append(f"--{cli_key}")
+                else:
+                    logger.info(f"Skipping --{cli_key} (set to False)")
+            elif value is None:
+                full_command.append(f"--{cli_key}")
             else:
                 full_command.extend([f"--{cli_key}", str(value)])
 
@@ -412,3 +426,17 @@ def configure_devices(
             result[parallel_size_param] = device_count
 
     return result, env_vars
+
+
+def get_machine_ip() -> str | None:
+    try:
+        # Create a socket to determine the primary network interface IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        # Connect to an external address (doesn't actually send data)
+        s.connect(("8.8.8.8", 80))
+        ip = str(s.getsockname()[0])
+        s.close()
+        return ip
+    except Exception:
+        return None

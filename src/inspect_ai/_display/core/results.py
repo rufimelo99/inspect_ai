@@ -1,14 +1,16 @@
-from datetime import datetime
+import math
+from contextvars import ContextVar
 from typing import Sequence, Set
 
-import numpy as np
 from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.text import Text
 
+from inspect_ai._util.dateutil import datetime_from_iso_format_safe
 from inspect_ai._util.rich import rich_traceback
 from inspect_ai.log import EvalStats
 from inspect_ai.log._log import EvalScore
+from inspect_ai.model._model_output import ModelUsage
 
 from .config import task_config, task_dict
 from .display import (
@@ -21,6 +23,20 @@ from .display import (
 )
 from .panel import task_panel
 from .rich import rich_theme
+
+# Extra args appended to the suggested `inspect eval-retry` command shown
+# when a task is interrupted. Set by the CLI from scanner-related flags
+# (e.g. `--scanner foo.yaml`, `--scan-model bar`) so a copy-paste of the
+# resume message preserves the scan setup. Defaults to empty for
+# programmatic (non-CLI) callers, which won't display a CLI command anyway.
+_retry_args_suffix: ContextVar[str] = ContextVar(
+    "inspect_retry_args_suffix", default=""
+)
+
+
+def set_retry_args_suffix(suffix: str) -> None:
+    """Set the extra args appended to the displayed `eval-retry` command."""
+    _retry_args_suffix.set(suffix)
 
 
 def tasks_results(tasks: Sequence[TaskWithResult]) -> RenderableType:
@@ -65,14 +81,44 @@ def task_results(profile: TaskProfile, success: TaskSuccess) -> RenderableType:
         for row in task_scores(success.results.scores):
             grid.add_row(row)
 
-    # note if some of our samples had errors
+    # note if some of our samples had errors or were stopped early
     if success.samples_completed < profile.samples:
-        sample_errors = profile.samples - success.samples_completed
-        sample_error_pct = int(float(sample_errors) / float(profile.samples) * 100)
-        message = f"\n[{theme.warning}]WARNING: {sample_errors} of {profile.samples} samples ({sample_error_pct}%) had errors and were not scored.[/{theme.warning}]\n"
-        return Group(grid, message)
-    else:
-        return grid
+        # pending message
+        message: list[str] = []
+
+        # early stopped
+        samples_early_stopped = (
+            len(success.results.early_stopping.early_stops)
+            if success.results.early_stopping
+            else 0
+        )
+        if samples_early_stopped > 0:
+            sample_early_stop_pct = int(
+                float(samples_early_stopped) / float(profile.samples) * 100
+            )
+            message.append(
+                f"[{theme.meta}]NOTE: {samples_early_stopped} of {profile.samples} samples ({sample_early_stop_pct}%) were not executed due to early stopping.[/{theme.meta}]"
+            )
+
+        # executed
+        samples_executed = profile.samples - samples_early_stopped
+
+        # errors
+        sample_errors = samples_executed - success.samples_completed
+        if sample_errors > 0:
+            sample_error_pct = int(float(sample_errors) / float(samples_executed) * 100)
+            scored_qualifier = (
+                "" if profile.eval_config.score_on_error else " and were not scored"
+            )
+            message.append(
+                f"[{theme.warning}]WARNING: {sample_errors} of {samples_executed} executed samples ({sample_error_pct}%) had errors{scored_qualifier}.[/{theme.warning}]"
+            )
+
+        # return special messages if we have them
+        if len(message) > 0:
+            return Group(grid, "\n" + "\n\n".join(message))
+
+    return grid
 
 
 SCORES_PER_ROW = 4
@@ -165,36 +211,57 @@ def task_stats(stats: EvalStats) -> RenderableType:
     table.add_column()
 
     # eval time
-    started = datetime.fromisoformat(stats.started_at)
-    completed = datetime.fromisoformat(stats.completed_at)
+    started = datetime_from_iso_format_safe(stats.started_at)
+    completed = datetime_from_iso_format_safe(stats.completed_at)
     elapsed = completed - started
     table.add_row(Text("total time:", style="bold"), f"  {elapsed}", style=theme.light)
 
     # token usage
     for model, usage in stats.model_usage.items():
-        if (
-            usage.input_tokens_cache_read is not None
-            or usage.input_tokens_cache_write is not None
-        ):
-            input_tokens_cache_read = usage.input_tokens_cache_read or 0
-            input_tokens_cache_write = usage.input_tokens_cache_write or 0
-            input_tokens = f"[bold]I: [/bold]{usage.input_tokens:,}, [bold]CW: [/bold]{input_tokens_cache_write:,}, [bold]CR: [/bold]{input_tokens_cache_read:,}"
-        else:
-            input_tokens = f"[bold]I: [/bold]{usage.input_tokens:,}"
-
-        if usage.reasoning_tokens is not None:
-            reasoning_tokens = f", [bold]R: [/bold]{usage.reasoning_tokens:,}"
-        else:
-            reasoning_tokens = ""
-
         table.add_row(
-            Text(model, style="bold"),
-            f"  {usage.total_tokens:,} tokens [{input_tokens}, [bold]O: [/bold]{usage.output_tokens:,}{reasoning_tokens}]",
+            *model_usage_summary(model, usage),
             style=theme.light,
         )
 
     panel.add_row(table)
+
+    # role usage
+    if stats.role_usage and len(stats.role_usage) > 0:
+        role_table = Table.grid(expand=True)
+        role_table.add_column(style="bold")
+        role_table.add_column()
+
+        for role, usage in stats.role_usage.items():
+            role_table.add_row(
+                *model_usage_summary(f"{role} (role)", usage),
+                style=theme.light,
+            )
+
+        panel.add_row(role_table)
+
     return panel
+
+
+def model_usage_summary(model: str, usage: ModelUsage) -> list[RenderableType]:
+    if (
+        usage.input_tokens_cache_read is not None
+        or usage.input_tokens_cache_write is not None
+    ):
+        input_tokens_cache_read = usage.input_tokens_cache_read or 0
+        input_tokens_cache_write = usage.input_tokens_cache_write or 0
+        input_tokens = f"[bold]I: [/bold]{usage.input_tokens:,}, [bold]CW: [/bold]{input_tokens_cache_write:,}, [bold]CR: [/bold]{input_tokens_cache_read:,}"
+    else:
+        input_tokens = f"[bold]I: [/bold]{usage.input_tokens:,}"
+
+    if usage.reasoning_tokens is not None:
+        reasoning_tokens = f", [bold]R: [/bold]{usage.reasoning_tokens:,}"
+    else:
+        reasoning_tokens = ""
+
+    return [
+        Text(model, style="bold"),
+        f"  {usage.total_tokens:,} tokens [{input_tokens}, [bold]O: [/bold]{usage.output_tokens:,}{reasoning_tokens}]",
+    ]
 
 
 def task_can_retry(profile: TaskProfile) -> bool:
@@ -208,9 +275,15 @@ def task_interrupted(profile: TaskProfile, samples_completed: int) -> Renderable
     if samples_completed > 0:
         message = f"{message}{samples_completed:,} of {profile.samples:,} total samples logged before interruption)."
         if task_can_retry(profile):
+            # preserve any scanner-related CLI flags the user passed so
+            # the suggested retry command resumes against the same scan
+            retry_extras = _retry_args_suffix.get()
+            retry_cmd = f"inspect eval-retry {log_location}"
+            if retry_extras:
+                retry_cmd = f"{retry_cmd} {retry_extras}"
             message = (
                 f"{message} Resume task with:[/{theme.error}][/bold]\n\n"
-                + f"[bold][{theme.light}]inspect eval-retry {log_location}[/{theme.light}][/bold]"
+                + f"[bold][{theme.light}]{retry_cmd}[/{theme.light}][/bold]"
             )
         else:
             message = f"{message}[/{theme.error}][/bold]"
@@ -231,7 +304,7 @@ def task_metric(metrics: list[TaskDisplayMetric], width: int | None = None) -> s
     )
 
     metric = metrics[0]
-    if metric.value is None or np.isnan(metric.value):
+    if metric.value is None or math.isnan(metric.value):
         value = " n/a"
     else:
         value = f"{metric.value:.2f}"

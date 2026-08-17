@@ -18,14 +18,17 @@ from typing_extensions import Unpack
 from inspect_ai._util._async import is_callable_coroutine
 from inspect_ai._util.registry import (
     RegistryInfo,
+    create_registry_object,
+    extract_named_params,
     registry_add,
-    registry_create,
     registry_name,
     registry_tag,
+    set_return_annotation,
 )
 from inspect_ai.agent._agent import Agent, is_agent
 from inspect_ai.agent._as_solver import as_solver
-from inspect_ai.model import CachePolicy, GenerateConfigArgs
+from inspect_ai.model import GenerateConfigArgs
+from inspect_ai.solver._constants import SOLVER_ALL_PARAMS_ATTR
 
 from ._task_state import TaskState, set_sample_state
 
@@ -36,7 +39,6 @@ class Generate(Protocol):
         self,
         state: TaskState,
         tool_calls: Literal["loop", "single", "none"] = "loop",
-        cache: bool | CachePolicy = False,
         **kwargs: Unpack[GenerateConfigArgs],
     ) -> TaskState:
         """Generate using the model and add the assistant message to the task state.
@@ -51,7 +53,6 @@ class Generate(Protocol):
                 - `"single"` resolves at most a single set of tool calls and then returns.
                 - `"none"` does not resolve tool calls at all (in this
                     case you will need to invoke `call_tools()` directly).
-            cache: Caching behaviour for generate responses (defaults to no caching).
             **kwargs: Optional generation config arguments.
 
         Returns:
@@ -69,6 +70,9 @@ class SolverSpec:
 
     args: dict[str, Any] = field(default_factory=dict)
     """Solver arguments."""
+
+    args_passed: dict[str, Any] = field(default_factory=dict)
+    """Solver arguments passed for invocation."""
 
 
 @runtime_checkable
@@ -125,7 +129,7 @@ def solver_register(solver: Callable[P, Solver], name: str = "") -> Callable[P, 
     return solver
 
 
-def solver_create(name: str, **kwargs: Any) -> Solver:
+def solver_create(name: str, /, **kwargs: Any) -> Solver:
     r"""Create a Solver based on its registered name.
 
     Args:
@@ -135,7 +139,10 @@ def solver_create(name: str, **kwargs: Any) -> Solver:
     Returns:
         Solver with registry info attribute
     """
-    return registry_create("solver", name, **kwargs)
+    # create_registry_object takes creation args as a dict, so a solver arg
+    # named `name`/`type` cannot collide with registry_create's own leading
+    # parameters on replay.
+    return cast(Solver, create_registry_object("solver", name, kwargs))
 
 
 SolverType: TypeAlias = Solver | Agent
@@ -209,8 +216,9 @@ def solver(
                 async def call_with_state(
                     state: TaskState, generate: Generate
                 ) -> TaskState:
+                    prev_state = state
                     state = await original_call(state, generate)
-                    set_sample_state(state)
+                    set_sample_state(state, replacing=prev_state)
                     return state
 
                 registered_solver = solver
@@ -224,8 +232,9 @@ def solver(
                 async def registered_solver(
                     state: TaskState, generate: Generate
                 ) -> TaskState:
+                    prev_state = state
                     state = await solver(state, generate)
-                    set_sample_state(state)
+                    set_sample_state(state, replacing=prev_state)
                     return state
 
             registry_tag(
@@ -236,11 +245,12 @@ def solver(
                 **kwargs,
             )
 
+            named_params = extract_named_params(solver_type, True, *args, **kwargs)
+            setattr(registered_solver, SOLVER_ALL_PARAMS_ATTR, named_params)
+
             return registered_solver
 
-        # functools.wraps overrides the return type annotation of the inner function, so
-        # we explicitly set it again
-        solver_wrapper.__annotations__["return"] = Solver
+        set_return_annotation(solver_wrapper, Solver)
 
         return solver_register(cast(Callable[P, Solver], solver_wrapper), solver_name)
 
@@ -261,7 +271,6 @@ def solver(
 @solver
 def generate(
     tool_calls: Literal["loop", "single", "none"] = "loop",
-    cache: bool | CachePolicy = False,
     **kwargs: Unpack[GenerateConfigArgs],
 ) -> Solver:
     r"""Generate output from the model and append it to task message history.
@@ -278,15 +287,12 @@ def generate(
         - `"none"` does not resolve tool calls at all (in this
             case you will need to invoke `call_tools()` directly).
 
-      cache: (bool | CachePolicy):
-        Caching behaviour for generate responses (defaults to no caching).
-
       **kwargs: Optional generation config arguments.
     """
 
     # call generate on the tasks
     async def solve(state: TaskState, generate: Generate) -> TaskState:
-        return await generate(state, tool_calls=tool_calls, cache=cache, **kwargs)
+        return await generate(state, tool_calls=tool_calls, **kwargs)
 
     # return solve
     return solve

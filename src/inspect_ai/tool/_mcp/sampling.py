@@ -1,7 +1,5 @@
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
-from mcp.client.session import ClientSession
-from mcp.shared.context import RequestContext
 from mcp.types import (
     INTERNAL_ERROR,
     AudioContent,
@@ -11,6 +9,7 @@ from mcp.types import (
     ErrorData,
     ImageContent,
     ResourceLink,
+    SamplingMessageContentBlock,
     TextContent,
     TextResourceContents,
 )
@@ -18,13 +17,29 @@ from mcp.types import (
     StopReason as MCPStopReason,
 )
 
-from inspect_ai._util.content import ContentAudio, ContentImage, ContentText
+from inspect_ai._util.content import (
+    Content,
+    ContentAudio,
+    ContentImage,
+    ContentText,
+)
 from inspect_ai._util.error import exception_message
 from inspect_ai._util.url import data_uri_mime_type, data_uri_to_base64
 
+from ._compat import (
+    content_mime_type,
+    create_message_result,
+    image_content,
+    params_max_tokens,
+    params_stop_sequences,
+    params_system_prompt,
+)
+
 
 async def sampling_fn(
-    context: RequestContext[ClientSession, Any],
+    # RequestContext[ClientSession, Any] on mcp 1.x, ClientRequestContext on
+    # 2.x — unused here, so typed as Any to satisfy both SamplingFnT protocols
+    context: Any,
     params: CreateMessageRequestParams,
 ) -> CreateMessageResult | ErrorData:
     from inspect_ai.model._chat_message import (
@@ -39,17 +54,20 @@ async def sampling_fn(
     try:
         # build message list
         messages: list[ChatMessage] = []
-        if params.systemPrompt:
-            messages.append(ChatMessageSystem(content=params.systemPrompt))
+        system_prompt = params_system_prompt(params)
+        if system_prompt:
+            messages.append(ChatMessageSystem(content=system_prompt))
 
         for message in params.messages:
             if message.role == "assistant":
                 messages.append(
-                    ChatMessageAssistant(content=[as_inspect_content(message.content)])
+                    ChatMessageAssistant(
+                        content=as_inspect_content_list(message.content)
+                    )
                 )
             elif message.role == "user":
                 messages.append(
-                    ChatMessageUser(content=[as_inspect_content(message.content)])
+                    ChatMessageUser(content=as_inspect_content_list(message.content))
                 )
 
         # sample w/ requested params
@@ -57,8 +75,8 @@ async def sampling_fn(
             messages,
             config=GenerateConfig(
                 temperature=params.temperature,
-                max_tokens=params.maxTokens,
-                stop_seqs=params.stopSequences,
+                max_tokens=params_max_tokens(params),
+                stop_seqs=params_stop_sequences(params),
             ),
         )
 
@@ -69,20 +87,18 @@ async def sampling_fn(
 
         # return first compatible content
         if isinstance(output.message.content, str):
-            return CreateMessageResult(
-                role="assistant",
+            return create_message_result(
                 content=TextContent(type="text", text=output.message.content),
                 model=output.model,
-                stopReason=stop_reason,
+                stop_reason=stop_reason,
             )
         else:
             for content in output.message.content:
                 if isinstance(content, ContentText | ContentImage):
-                    return CreateMessageResult(
-                        role="assistant",
+                    return create_message_result(
                         content=as_mcp_content(content),
                         model=output.model,
-                        stopReason=stop_reason,
+                        stop_reason=stop_reason,
                     )
 
             # if we get this far then no valid content was returned
@@ -94,28 +110,36 @@ async def sampling_fn(
         return ErrorData(code=INTERNAL_ERROR, message=exception_message(ex))
 
 
+def as_inspect_content_list(
+    content: SamplingMessageContentBlock | Sequence[SamplingMessageContentBlock],
+) -> list[Content]:
+    if isinstance(content, Sequence):
+        return [as_inspect_content(c) for c in content]
+    else:
+        return [as_inspect_content(content)]
+
+
 def as_inspect_content(
-    content: TextContent
-    | ImageContent
-    | AudioContent
-    | ResourceLink
-    | EmbeddedResource,
+    content: SamplingMessageContentBlock,
 ) -> ContentText | ContentImage | ContentAudio:
     if isinstance(content, TextContent):
         return ContentText(text=content.text)
     elif isinstance(content, ImageContent):
         return ContentImage(
-            image=f"data:image/{content.mimeType};base64,{content.data}"
+            image=f"data:{content_mime_type(content)};base64,{content.data}"
         )
     elif isinstance(content, AudioContent):
         return ContentAudio(
-            audio=f"data:audio/{content.mimeType};base64,{content.data}",
-            format=_get_audio_format(content.mimeType),
+            audio=f"data:{content_mime_type(content)};base64,{content.data}",
+            format=_get_audio_format(content_mime_type(content)),
         )
     elif isinstance(content, ResourceLink):
         return ContentText(text=f"{content.description} ({content.uri})")
-    elif isinstance(content.resource, TextResourceContents):
+    elif isinstance(content, EmbeddedResource) and isinstance(
+        content.resource, TextResourceContents
+    ):
         return ContentText(text=content.resource.text)
+    # TODO:  ToolResultContent, ToolUseContent,
     else:
         raise ValueError(f"Unexpected content: {content}")
 
@@ -124,9 +148,8 @@ def as_mcp_content(content: ContentText | ContentImage) -> TextContent | ImageCo
     if isinstance(content, ContentText):
         return TextContent(type="text", text=content.text)
     else:
-        return ImageContent(
-            type="image",
-            mimeType=data_uri_mime_type(content.image) or "image/png",
+        return image_content(
+            mime_type=data_uri_mime_type(content.image) or "image/png",
             data=data_uri_to_base64(content.image),
         )
 

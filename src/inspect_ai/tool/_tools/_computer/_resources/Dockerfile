@@ -28,7 +28,8 @@ RUN apt-get update && \
       # A command-line tool for taking screenshots.
       scrot \
       # A suite for image manipulation — needed for scaling images.
-      imagemagick && \
+      imagemagick \
+      sudo && \
     apt-get clean
 
 # Userland apt-get'able apps
@@ -55,7 +56,10 @@ RUN apt-get install -y \
     sh -c 'echo "deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list' && \
     apt-get update && \
     apt-get install -y code && \
-    apt-get clean
+    apt-get clean && \
+    mv /usr/bin/code /usr/bin/code.orig && \
+    printf '#!/bin/bash\nexec /usr/bin/code.orig --no-sandbox "$@"\n' > /usr/bin/code && \
+    chmod +x /usr/bin/code
 
 # configure noVNC
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html

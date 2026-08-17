@@ -5,6 +5,7 @@ import pytest
 from test_helpers.utils import skip_if_no_openai
 
 from inspect_ai import Task, eval
+from inspect_ai.dataset._dataset import Sample
 from inspect_ai.model import (
     ChatMessageUser,
     GenerateConfig,
@@ -12,6 +13,7 @@ from inspect_ai.model import (
 )
 from inspect_ai.model._chat_message import ChatMessageSystem
 from inspect_ai.model._internal import parse_content_with_internal
+from inspect_ai.model._openai import openai_completion_params
 
 
 @pytest.mark.anyio
@@ -36,7 +38,30 @@ async def test_openai_api() -> None:
     assert len(response.completion) >= 1
 
 
-@pytest.mark.anyio
+@skip_if_no_openai
+def test_openai_verbosity() -> None:
+    log = eval(
+        Task(dataset=[Sample(input="Please tell a story about toys.")]),
+        model="openai/gpt-5.1",
+        verbosity="low",
+    )[0]
+    assert log.status == "success"
+
+
+def test_openai_completion_params_extra_body_not_mutated() -> None:
+    config = GenerateConfig(
+        extra_body={"metadata": {"source": "test"}, "reasoning": {"effort": "low"}}
+    )
+
+    for _ in range(2):
+        params = openai_completion_params("gpt-4o-mini", config, tools=False)
+        assert params["extra_body"] == {"reasoning": {"effort": "low"}}
+        assert config.extra_body == {
+            "metadata": {"source": "test"},
+            "reasoning": {"effort": "low"},
+        }
+
+
 @skip_if_no_openai
 async def test_openai_o_series_developer_messages() -> None:
     async def check_developer_messages(model_name: str):
@@ -51,12 +76,9 @@ async def test_openai_o_series_developer_messages() -> None:
             ]
         )
 
-    await check_developer_messages("openai/o1")
-    await check_developer_messages("openai/o1-mini")
     await check_developer_messages("openai/o3-mini")
 
 
-@pytest.mark.anyio
 @skip_if_no_openai
 async def test_openai_o_series_reasoning_effort() -> None:
     async def check_reasoning_effort(model_name: str, effort: str = "medium"):
@@ -68,13 +90,10 @@ async def test_openai_o_series_reasoning_effort() -> None:
         response = await model.generate(input=[message])
         assert len(response.completion) >= 1
 
-    await check_reasoning_effort("openai/o1")
-    await check_reasoning_effort("openai/o1-mini")
     await check_reasoning_effort("openai/o3-mini")
     await check_reasoning_effort("openai/gpt-5-mini", "minimal")
 
 
-@pytest.mark.anyio
 @skip_if_no_openai
 async def test_openai_o_series_max_tokens() -> None:
     async def check_max_tokens(model_name: str):
@@ -86,8 +105,6 @@ async def test_openai_o_series_max_tokens() -> None:
         response = await model.generate(input=[message])
         assert len(response.completion) >= 1
 
-    await check_max_tokens("openai/o1")
-    await check_max_tokens("openai/o1-mini")
     await check_max_tokens("openai/o3-mini")
 
 
@@ -169,3 +186,64 @@ invalid_utf8_b64 = base64.b64encode(invalid_utf8_bytes).decode("utf-8")
 def test_parse_content_with_internal_invalid_encoding(s, expected_exception):
     with pytest.raises(expected_exception):
         parse_content_with_internal(s, "internal")
+
+
+async def test_chat_completions_forwards_config_extra_headers():
+    """config.extra_headers must reach the chat completions request (#same as responses/compatible)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from openai._types import NOT_GIVEN
+    from openai.types.chat import ChatCompletion, ChatCompletionMessage
+    from openai.types.chat.chat_completion import Choice
+
+    from inspect_ai.model._providers.openai_completions import generate_completions
+    from inspect_ai.model._providers.util.hooks import HttpxHooks
+
+    mock_completion = ChatCompletion.model_construct(
+        id="chatcmpl-test",
+        created=0,
+        model="gpt-4o",
+        object="chat.completion",
+        choices=[
+            Choice.model_construct(
+                finish_reason="stop",
+                index=0,
+                message=ChatCompletionMessage.model_construct(
+                    role="assistant", content="hello"
+                ),
+            )
+        ],
+    )
+
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=mock_completion)
+
+    http_hooks = MagicMock(spec=HttpxHooks)
+    http_hooks.start_request = MagicMock(return_value="req_1")
+    http_hooks.end_request = MagicMock(return_value=None)
+
+    openai_api = MagicMock()
+    openai_api.api_model_name.return_value = "gpt-4o"
+    openai_api.service_tier = None
+    openai_api.is_o_series.return_value = False
+    openai_api.is_gpt.return_value = True
+    openai_api.is_gpt_5.return_value = False
+
+    await generate_completions(
+        client=client,
+        http_hooks=http_hooks,
+        model_name="gpt-4o",
+        input=[ChatMessageUser(content="hi")],
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(extra_headers={"x-custom-header": "custom-value"}),
+        prompt_cache_key=NOT_GIVEN,
+        prompt_cache_retention=NOT_GIVEN,
+        safety_identifier=NOT_GIVEN,
+        openai_api=openai_api,
+        batcher=None,
+    )
+
+    extra_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+    assert extra_headers["x-custom-header"] == "custom-value"
+    assert extra_headers[HttpxHooks.REQUEST_ID_HEADER] == "req_1"

@@ -1,16 +1,21 @@
+from __future__ import annotations
+
 import html
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.align import AlignMethod
 from rich.box import ROUNDED, Box
 from rich.console import Group, RenderableType
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
+if TYPE_CHECKING:
+    from rich.markdown import Markdown
+
 from inspect_ai._util.content import ContentReasoning
+from inspect_ai._util.text import truncate_lines
 
 from .format import format_function_call
 
@@ -20,6 +25,8 @@ def transcript_code_theme() -> str:
 
 
 def transcript_markdown(content: str, *, escape: bool = False) -> Markdown:
+    from rich.markdown import Markdown
+
     code_theme = transcript_code_theme()
     return Markdown(
         html_escape_markdown(content) if escape else content,
@@ -69,11 +76,16 @@ def set_transcript_markdown_options(markdown: Markdown) -> None:
 def transcript_panel(
     title: str,
     subtitle: str | None = None,
-    content: RenderableType | list[RenderableType] = [],
+    content: RenderableType | list[RenderableType] | None = None,
     level: int = 1,
 ) -> Panel:
+    from rich.markdown import Markdown
+
     # resolve content to list
-    content = content if isinstance(content, list) else [content]
+    if content is None:
+        content = []
+    elif not isinstance(content, list):
+        content = [content]
 
     # no padding if there is no content
     padding = (0, 1) if content else (0, 0)
@@ -113,6 +125,20 @@ def transcript_panel(
     )
 
 
+def content_display(text: str, max_lines: int = 50) -> list[RenderableType]:
+    """Truncate text content and render as markdown."""
+    truncated_text, additional = truncate_lines(text, max_lines)
+    content: list[RenderableType] = [transcript_markdown(truncated_text, escape=True)]
+    if additional is not None:
+        content.append(Text())
+        content.append(
+            Text.from_markup(
+                f"[italic]Content truncated ({additional} additional lines)...[/italic]"
+            )
+        )
+    return content
+
+
 def transcript_reasoning(reasoning: ContentReasoning) -> list[RenderableType]:
     content: list[RenderableType] = []
     text = (
@@ -122,9 +148,14 @@ def transcript_reasoning(reasoning: ContentReasoning) -> list[RenderableType]:
     ).strip()
 
     if len(text) > 0:
+        truncated_text, additional = truncate_lines(text, 50)
+        if additional is not None:
+            truncated_text += (
+                f"\n\n_Content truncated ({additional} additional lines)..._"
+            )
         content.append(
             transcript_markdown(
-                f"**<think>**  \n{text}  \n**</think>**\n\n", escape=True
+                f"**<think>**  \n{truncated_text}  \n**</think>**\n\n", escape=True
             )
         )
         content.append(Text())

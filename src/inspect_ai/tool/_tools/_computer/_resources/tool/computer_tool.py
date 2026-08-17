@@ -112,6 +112,12 @@ async def execute_action(args: Namespace) -> ToolResult:
             return await computer.wait(not_none(args.duration, "duration"))
         case "screenshot":
             return await computer.screenshot()
+        case "zoom":
+            return await computer.zoom(not_none(args.region, "region"))
+        case "open_web_browser":
+            return await computer.open_web_browser()
+        case "navigate":
+            return await computer.navigate(not_none(args.text, "text"))
 
     raise ComputerToolError(f"Invalid action: {action}")
 

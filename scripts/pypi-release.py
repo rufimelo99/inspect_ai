@@ -34,7 +34,7 @@ def setup_logging(name: str) -> None:
     log_dir = Path("release-logs")
     log_dir.mkdir(exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
     log_file = log_dir / f"{name}_{timestamp}.log"
 
     # Configure logging
@@ -547,9 +547,11 @@ def release_command(args):
                 # Get all files in dist/ directory
                 dist_files = list(Path("dist").glob("*"))
                 if dist_files:
-                    upload_cmd = ["python3", "-m", "twine", "upload"] + [
-                        str(f) for f in dist_files
-                    ]
+                    upload_cmd = (
+                        ["python3", "-m", "twine", "upload"]
+                        + [str(f) for f in dist_files]
+                        + ["--verbose"]
+                    )
                     run_command(upload_cmd, dry_run=dry_run)
                 else:
                     logging.error("No files found in dist/ directory")
